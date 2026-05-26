@@ -20,3 +20,8 @@ skip-magic-trailing-comma = false
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[dependency-groups]
+dev = [
+    "ninja>=1.13.0",
+]
