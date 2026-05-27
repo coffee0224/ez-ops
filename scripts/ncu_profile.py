@@ -150,7 +150,7 @@ def generate_profile_script(op_name: str, kernel_name: str, pos_args: list, kw_a
     """)
 
 
-def warmup(op_name: str, pos_args: list, kw_args: dict, n_warmup: int):
+def warmup(op_name: str, kernel_name: str, pos_args: list, kw_args: dict, n_warmup: int):
     """Warm up the GPU by running a kernel repeatedly."""
     import importlib
 
@@ -160,18 +160,15 @@ def warmup(op_name: str, pos_args: list, kw_args: dict, n_warmup: int):
     mod = importlib.import_module("ezops")
     op_cls = getattr(mod, class_name)
 
-    from ezops import list_backends
-
-    backends = list_backends(op_name)
-    backend = backends[0] if backends else "triton"
-
+    backend = None if kernel_name == "ref" else kernel_name
     params_str = _build_op_params_str(pos_args, kw_args, backend)
     # Use eval for simplicity since we control all inputs
     op = eval(f"op_cls({params_str})")  # noqa: S307
     data = op.gen_data()
 
+    call_fn = op._ref_forward if kernel_name == "ref" else op.__call__
     for _ in range(n_warmup):
-        op(*data)
+        call_fn(*data)
     torch.cuda.synchronize()
 
     del op, data
@@ -242,17 +239,16 @@ def main():
         print(f"Error: cannot import {class_name} from ezops: {e}")
         sys.exit(1)
 
-    # Warm up GPU clocks
-    print(f"Warming up GPU ({args.warmup} iters, {args.op_name}) ...")
-    try:
-        warmup(args.op_name, pos_args, kw_args, args.warmup)
-    except Exception as e:
-        print(f"Warning: warmup failed: {e}")
-
-    # Profile each kernel
+    # Profile each kernel (warmup with the same kernel)
     for kernel_name in kernels:
         label = f"{args.op_name}/{kernel_name}"
-        print(f"\nProfiling {label} ...")
+        print(f"\nWarming up {label} ({args.warmup} iters) ...")
+        try:
+            warmup(args.op_name, kernel_name, pos_args, kw_args, args.warmup)
+        except Exception as e:
+            print(f"Warning: warmup failed: {e}")
+
+        print(f"Profiling {label} ...")
 
         script = generate_profile_script(args.op_name, kernel_name, pos_args, kw_args)
         script_path = output_dir / f"_run_{args.op_name}_{kernel_name}.py"
