@@ -10,33 +10,48 @@ from ..base_kernel import BaseKernel
 from ...registry import register_kernel
 
 
-@register_kernel("gemv", "tilelang")
-class GemvTileLangKernel(BaseKernel):
+@register_kernel("gemv", "naive_gemv_tilelang")
+class NaiveGemvTileLangKernel(BaseKernel):
     def __init__(self, N: int, K: int):
         self.N = N
         self.K = K
-        self.block_size = 1024  # TODO: tune for this op
         self._kernel = self._make_kernel()
 
     def _make_kernel(self):
-        N = self.N
-        K = self.K
-
         @tilelang.jit(out_idx=[2])
-        def kernel(BLOCK: int):
+        def kernel(
+            N: int,
+            K: int,
+            BLOCK_N: int,
+            BLOCK_K: int,
+            dtype: T.dtype = T.bfloat16,
+            accum_dtype: T.dtype = T.float,
+        ):
             @T.prim_func
             def main(
-                A: T.Buffer((1, K), "float16"),
-                B: T.Buffer((K, N), "float16"),
-                C: T.Buffer((1, N), "float16"),
+                A: T.Buffer((1, K), dtype),
+                B: T.Buffer((K, N), dtype),
+                C: T.Buffer((1, N), dtype),
             ):
-                # TODO: implement the tilelang kernel for gemv
-                with T.Kernel(1, threads=BLOCK) as bx:
-                    raise NotImplementedError("TODO: implement tilelang kernel for gemv")
+                with T.Kernel(T.ceildiv(N, BLOCK_N)) as bn:
+                    tn = T.get_thread_binding(0)  # tn = threadIdx.x
+                    A_shared = T.alloc_shared((BLOCK_K,), dtype)
+                    B_shared = T.alloc_shared((BLOCK_N, BLOCK_K), dtype)
+                    C_reg = T.alloc_local((1,), accum_dtype)
+                    T.clear(C_reg)
+                    for bk in T.serial(T.ceildiv(K, BLOCK_K)):
+                        for tk in T.serial(BLOCK_K):
+                            A_shared[tk] = A[0, bk * BLOCK_K + tk]
+                            B_shared[tn, tk] = B[bk * BLOCK_K + tk, bn * BLOCK_N + tn]
+                        for tk in T.serial(BLOCK_K):
+                            C_reg[0] += A_shared[tk].astype(accum_dtype) * B_shared[tn, tk].astype(accum_dtype)
+                    C[0, bn * BLOCK_N + tn] = C_reg[0]
+
             return main
+
         return kernel
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
         assert A.is_cuda and B.is_cuda and C.is_cuda
-        # TODO: implement the call logic for gemv
-        raise NotImplementedError("TODO: implement tilelang __call__ for gemv")
+        out = self._kernel(N=self.N, K=self.K, BLOCK_N=128, BLOCK_K=128)(A, B)
+        C.copy_(out)
