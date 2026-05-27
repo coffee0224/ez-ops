@@ -1,0 +1,29 @@
+# GPU Profile: NVIDIA GeForce RTX 5060 Ti
+# Calibration: benchmarks/hardware/ microbenchmarks
+#
+# Only store theoretical + calibration here.
+# effective = theoretical * calibration is computed by load_profile().
+
+gpu: NVIDIA GeForce RTX 5060 Ti
+compute_capability: 12.0
+
+hbm:
+  theoretical: 448e9        # bytes/s, spec sheet
+  calibration: 0.846         # STREAM Triad
+
+tensor_core:
+  bf16:
+    theoretical: 47.4e12     # FLOPS, spec sheet (dense)
+    calibration: 1.04
+
+  fp16:
+    theoretical: 47.4e12     # FLOPS, spec sheet (dense)
+    calibration: 1.03
+
+  tf32:
+    theoretical: 23.7e12     # FLOPS, spec sheet (dense)
+    calibration: 1.04
+
+  fp8:
+    theoretical: 189.6e12     # FLOPS, spec sheet (dense)
+    calibration: 0.94
