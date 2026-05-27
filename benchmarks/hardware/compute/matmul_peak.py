@@ -32,8 +32,11 @@ _DTYPE_MAP = {
     "fp16": torch.float16,
     "bfloat16": torch.bfloat16,
     "bf16": torch.bfloat16,
-    "tf32": torch.float32,  # tf32 is a compute mode, not a storage dtype
+    "tf32": torch.float32,
+    "fp8": torch.float8_e4m3fn,
 }
+
+_FP8_DTYPE = getattr(torch, "float8_e4m3fn", None)
 
 
 def _detect_gpu():
@@ -42,10 +45,15 @@ def _detect_gpu():
 
 
 def _max_m_for_memory(n, k, dtype, total_mem_bytes, safety=0.8):
-    elem_bytes = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+    if dtype == _FP8_DTYPE:
+        elem_bytes = 1
+    elif dtype in (torch.float16, torch.bfloat16):
+        elem_bytes = 2
+    else:
+        elem_bytes = 4
     max_usable = total_mem_bytes * safety
-    b_bytes = k * n * elem_bytes  # B(K,N) is fixed
-    per_m = (k + n) * elem_bytes  # one row of A(M,K) + one row of C(M,N)
+    b_bytes = k * n * elem_bytes
+    per_m = (k + n) * elem_bytes
     available = max_usable - b_bytes
     if available <= 0 or per_m <= 0:
         return 256
@@ -56,13 +64,48 @@ def _flush_l2(cache_buf):
     cache_buf.fill_(0x5A5A5A5A)
 
 
+def _benchmark_shape_fp8(M, N, K, n_warmup, n_iter, cache_buf):
+    """FP8 matmul benchmark using torch._scaled_mm."""
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16).to(_FP8_DTYPE)
+    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16).to(_FP8_DTYPE)
+    scale = torch.tensor(1.0, device="cuda")
+
+    for _ in range(n_warmup):
+        torch._scaled_mm(a, b, scale_a=scale, scale_b=scale)
+
+    torch.cuda.synchronize()
+
+    flops = 2.0 * M * N * K
+    times = []
+
+    for _ in range(n_iter):
+        _flush_l2(cache_buf)
+        a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16).to(_FP8_DTYPE)
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        torch._scaled_mm(a, b, scale_a=scale, scale_b=scale)
+        end.record()
+        torch.cuda.synchronize()
+
+        times.append(start.elapsed_time(end) / 1000.0)
+
+    median_s = sorted(times)[len(times) // 2]
+    tflops = flops / median_s / 1e12
+    mean_s = sum(times) / len(times)
+    tflops_mean = flops / mean_s / 1e12
+    tflops_max = flops / min(times) / 1e12
+
+    return tflops_mean, tflops, tflops_max
+
+
 def _benchmark_shape(M, N, K, dtype, n_warmup, n_iter, cache_buf, use_tf32=False):
     """Run matmul benchmark for a single shape, return (mean, median, max) TFLOPS."""
     a = torch.randn(M, K, device="cuda", dtype=dtype)
     b = torch.randn(K, N, device="cuda", dtype=dtype)
     c = torch.randn(M, N, device="cuda", dtype=dtype)
 
-    # Warmup
     for _ in range(n_warmup):
         torch.mm(a, b, out=c)
 
@@ -82,7 +125,7 @@ def _benchmark_shape(M, N, K, dtype, n_warmup, n_iter, cache_buf, use_tf32=False
         end.record()
         torch.cuda.synchronize()
 
-        times.append(start.elapsed_time(end) / 1000.0)  # ms → s
+        times.append(start.elapsed_time(end) / 1000.0)
 
     median_s = sorted(times)[len(times) // 2]
     tflops = flops / median_s / 1e12
@@ -94,7 +137,6 @@ def _benchmark_shape(M, N, K, dtype, n_warmup, n_iter, cache_buf, use_tf32=False
 
 
 def _phase1_shapes(max_m, step=512, n=4096, k=4096):
-    """Coarse sweep: M from 256 to max_m in large steps."""
     shapes = []
     m = 256
     while m <= max_m:
@@ -104,7 +146,6 @@ def _phase1_shapes(max_m, step=512, n=4096, k=4096):
 
 
 def _phase2_shapes(top_ms, n=4096, k=4096, radius=512, step=128):
-    """Fine sweep around the best M values from phase 1."""
     shapes = []
     seen = set()
     for m in top_ms:
@@ -125,7 +166,7 @@ def run(dtype="bf16", n=4096, k=4096, m_min=256, m_max=None, m_step=512,
     """Run matmul peak FLOPS benchmark.
 
     Args:
-        dtype: "bf16", "fp16", "fp32", or "tf32".
+        dtype: "bf16", "fp16", "fp32", "tf32", or "fp8".
         n: N dimension.
         k: K dimension.
         m_min: Minimum M dimension.
@@ -150,10 +191,12 @@ def run(dtype="bf16", n=4096, k=4096, m_min=256, m_max=None, m_step=512,
     if dtype not in _DTYPE_MAP:
         raise ValueError(f"Unsupported dtype '{dtype}'. Choose from: {sorted(_DTYPE_MAP)}")
 
+    use_fp8 = dtype == "fp8"
     use_tf32 = dtype == "tf32"
+    torch_dtype = _DTYPE_MAP[dtype]
+
     if use_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
-    torch_dtype = _DTYPE_MAP[dtype]
 
     gpu_name, total_mem = _detect_gpu()
     profile = detect_profile(gpu_name)
@@ -175,13 +218,14 @@ def run(dtype="bf16", n=4096, k=4096, m_min=256, m_max=None, m_step=512,
     # L2 flush buffer
     cache_buf = torch.empty(cache_mb * 1024 * 1024 // 4, device="cuda", dtype=torch.float32)
 
-    # GPU warmup: run heavy matmul to reach steady clock
+    # GPU warmup
     if not quiet:
         print(f"GPU warmup ({gpu_warmup_secs}s) ...", end=" ", flush=True)
+    warmup_dtype = torch.bfloat16 if use_fp8 else torch_dtype
     warmup_end = time.time() + gpu_warmup_secs
-    wa = torch.randn(4096, 4096, device="cuda", dtype=torch_dtype)
-    wb = torch.randn(4096, 4096, device="cuda", dtype=torch_dtype)
-    wc = torch.randn(4096, 4096, device="cuda", dtype=torch_dtype)
+    wa = torch.randn(4096, 4096, device="cuda", dtype=warmup_dtype)
+    wb = torch.randn(4096, 4096, device="cuda", dtype=warmup_dtype)
+    wc = torch.randn(4096, 4096, device="cuda", dtype=warmup_dtype)
     while time.time() < warmup_end:
         torch.mm(wa, wb, out=wc)
     torch.cuda.synchronize()
@@ -190,7 +234,9 @@ def run(dtype="bf16", n=4096, k=4096, m_min=256, m_max=None, m_step=512,
     if not quiet:
         print("done")
 
-    # Phase 1: coarse sweep
+    bench_fn = _benchmark_shape_fp8 if use_fp8 else _benchmark_shape
+
+    # Phase 1
     shapes = _phase1_shapes(m_max, step=m_step, n=n, k=k)
     shapes = [(m, nn, kk) for m, nn, kk in shapes if m >= m_min]
     if not quiet:
@@ -198,13 +244,16 @@ def run(dtype="bf16", n=4096, k=4096, m_min=256, m_max=None, m_step=512,
 
     results = []
     for i, (M, N, K) in enumerate(shapes):
-        mean_tf, med_tf, max_tf = _benchmark_shape(
-            M, N, K, torch_dtype, warmup, n_iter, cache_buf, use_tf32)
+        if use_fp8:
+            mean_tf, med_tf, max_tf = bench_fn(M, N, K, warmup, n_iter, cache_buf)
+        else:
+            mean_tf, med_tf, max_tf = bench_fn(
+                M, N, K, torch_dtype, warmup, n_iter, cache_buf, use_tf32)
         results.append((M, N, K, mean_tf, med_tf, max_tf))
         if not quiet and ((i + 1) % 5 == 0 or i == len(shapes) - 1):
             print(f"  [{i+1}/{len(shapes)}] M={M:>5}  median={med_tf:.1f} TFLOPS")
 
-    # Phase 2: fine sweep around top-K
+    # Phase 2
     results.sort(key=lambda x: x[4], reverse=True)
     top_ms = [r[0] for r in results[:top_k]]
     fine_shapes = _phase2_shapes(top_ms, n=n, k=k, radius=phase2_radius, step=phase2_step)
@@ -216,16 +265,18 @@ def run(dtype="bf16", n=4096, k=4096, m_min=256, m_max=None, m_step=512,
         if not quiet:
             print(f"\nPhase 2: {len(fine_shapes)} shapes around top M values {top_ms} ...")
         for i, (M, N, K) in enumerate(fine_shapes):
-            mean_tf, med_tf, max_tf = _benchmark_shape(
-                M, N, K, torch_dtype, warmup, n_iter, cache_buf, use_tf32)
+            if use_fp8:
+                mean_tf, med_tf, max_tf = bench_fn(M, N, K, warmup, n_iter, cache_buf)
+            else:
+                mean_tf, med_tf, max_tf = bench_fn(
+                    M, N, K, torch_dtype, warmup, n_iter, cache_buf, use_tf32)
             results.append((M, N, K, mean_tf, med_tf, max_tf))
             if not quiet and ((i + 1) % 5 == 0 or i == len(fine_shapes) - 1):
                 print(f"  [{i+1}/{len(fine_shapes)}] M={M:>5}  median={med_tf:.1f} TFLOPS")
 
-    # Final ranking
     results.sort(key=lambda x: x[4], reverse=True)
     best = results[0]
-    best_tflops = best[4]  # median
+    best_tflops = best[4]
 
     calibration = None
     if theoretical_tflops and theoretical_tflops > 0:

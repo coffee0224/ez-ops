@@ -115,8 +115,8 @@ def generate_yaml(gpu_name, compute_cap, hbm_result, compute_results, specs):
 def main():
     parser = argparse.ArgumentParser(description="Generate GPU roofline profile YAML")
     parser.add_argument("--output-dir", default="assets", help="Output directory (default: assets)")
-    parser.add_argument("--dtypes", default="bf16",
-                        help="Dtypes to benchmark, comma-separated (default: bf16)")
+    parser.add_argument("--dtypes", default="bf16,fp16,tf32,fp8",
+                        help="Dtypes to benchmark, comma-separated (default: bf16,fp16,tf32,fp8)")
     parser.add_argument("--quick", action="store_true",
                         help="Quick mode: fewer iterations, smaller sweep")
     args = parser.parse_args()
@@ -166,13 +166,17 @@ def main():
     compute_results = {}
     for dtype in dtypes:
         print(f"\n--- {dtype} ---")
-        result = run_matmul(
-            dtype=dtype,
-            warmup=5 if args.quick else 30,
-            n_iter=20 if args.quick else 100,
-            m_step=1024 if args.quick else 512,
-            gpu_warmup_secs=3 if args.quick else 5,
-        )
+        try:
+            result = run_matmul(
+                dtype=dtype,
+                warmup=5 if args.quick else 30,
+                n_iter=20 if args.quick else 100,
+                m_step=1024 if args.quick else 512,
+                gpu_warmup_secs=3 if args.quick else 5,
+            )
+        except Exception as e:
+            print(f"  SKIP: {e}")
+            continue
         compute_results[dtype] = result
         print(f"\n  Best: M={result['best_shape'][0]}, N={result['best_shape'][1]}, "
               f"K={result['best_shape'][2]}  →  {result['best_tflops']:.1f} TFLOPS")

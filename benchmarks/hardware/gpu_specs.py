@@ -4,9 +4,11 @@ Theoretical HBM bandwidth and tensor core peak FLOPS (dense, no sparsity).
 All TFLOPS values use FMA=2 counting (multiply + add counted separately),
 matching the standard roofline convention (flops = 2*M*N*K for matmul).
 
-Convention note: datacenter GPU TFLOPS use the NVIDIA headline values
-(FP16 accumulate for Hopper/Ada-DC). Consumer GPU TFLOPS use FP32 accumulate
-(as specified in NVIDIA Ada/Blackwell whitepapers for consumer GPUs).
+Convention:
+  - FP16/BF16/TF32: datacenter uses NVIDIA headline (FP16 acc for Hopper/Ada-DC);
+    consumer uses FP32 acc (from NVIDIA Ada/Blackwell whitepapers).
+  - FP8: all GPUs use FP16 accumulate, matching torch._scaled_mm behavior.
+    FP8 = 2 × FP8(FP32 acc) = 4 × FP16(FP32 acc) = 8 × FP32.
 """
 
 # Profile key → specs
@@ -93,16 +95,16 @@ PROFILES = {
             "tf32": 181.0, "fp8": 724.0,
         },
     },
-    # ── Ada Lovelace (consumer) — FP32 accumulate, dense ──────────────────
+    # ── Ada Lovelace (consumer) — FP16/BF16/TF32: FP32 acc; FP8: FP16 acc ──
     # Source: NVIDIA Ada Architecture Whitepaper
-    # Ratios: FP16/BF16 = 2×FP32, TF32 = FP32, FP8 = 4×FP32
+    # FP16/BF16(FP32 acc) = 2×FP32, TF32 = FP32, FP8(FP16 acc) = 8×FP32
     "rtx_4090": {
         "names": ["NVIDIA GeForce RTX 4090"],
         "compute_cap": "8.9",
         "hbm_bw_gb": 1008.0,
         "tensor_core_tflops": {
             "fp16": 165.2, "bf16": 165.2,
-            "tf32": 82.6, "fp8": 330.4,
+            "tf32": 82.6, "fp8": 660.8,
         },
     },
     "rtx_4080": {
@@ -111,7 +113,7 @@ PROFILES = {
         "hbm_bw_gb": 716.8,
         "tensor_core_tflops": {
             "fp16": 97.5, "bf16": 97.5,
-            "tf32": 48.7, "fp8": 195.0,
+            "tf32": 48.7, "fp8": 389.6,
         },
     },
     "rtx_4070_ti": {
@@ -120,7 +122,7 @@ PROFILES = {
         "hbm_bw_gb": 504.0,
         "tensor_core_tflops": {
             "fp16": 80.2, "bf16": 80.2,
-            "tf32": 40.1, "fp8": 160.4,
+            "tf32": 40.1, "fp8": 320.8,
         },
     },
     "rtx_4070": {
@@ -129,19 +131,19 @@ PROFILES = {
         "hbm_bw_gb": 504.0,
         "tensor_core_tflops": {
             "fp16": 58.3, "bf16": 58.3,
-            "tf32": 29.1, "fp8": 116.6,
+            "tf32": 29.1, "fp8": 232.8,
         },
     },
-    # ── Blackwell (consumer) — FP32 accumulate, dense ─────────────────────
+    # ── Blackwell (consumer) — FP16/BF16/TF32: FP32 acc; FP8: FP16 acc ────
     # Source: NVIDIA RTX Blackwell GPU Architecture Whitepaper
-    # FP16(FP32 acc) = FP16(FP16 acc)/2; FP8(FP32 acc) = 2×FP16(FP32 acc)
+    # FP16(FP32 acc) = FP16(FP16 acc)/2; FP8(FP16 acc) = 4×FP16(FP32 acc) = 8×FP32
     "rtx_5090": {
         "names": ["NVIDIA GeForce RTX 5090"],
         "compute_cap": "12.0",
         "hbm_bw_gb": 1792.0,
         "tensor_core_tflops": {
             "fp16": 209.5, "bf16": 209.5,
-            "tf32": 104.8, "fp8": 419.0,
+            "tf32": 104.8, "fp8": 838.0,
         },
     },
     "rtx_5080": {
@@ -150,7 +152,7 @@ PROFILES = {
         "hbm_bw_gb": 960.0,
         "tensor_core_tflops": {
             "fp16": 112.6, "bf16": 112.6,
-            "tf32": 56.3, "fp8": 225.1,
+            "tf32": 56.3, "fp8": 450.2,
         },
     },
     "rtx_5070_ti": {
@@ -159,7 +161,7 @@ PROFILES = {
         "hbm_bw_gb": 896.0,
         "tensor_core_tflops": {
             "fp16": 87.9, "bf16": 87.9,
-            "tf32": 43.9, "fp8": 175.8,
+            "tf32": 43.9, "fp8": 351.6,
         },
     },
     "rtx_5070": {
@@ -168,7 +170,7 @@ PROFILES = {
         "hbm_bw_gb": 672.0,
         "tensor_core_tflops": {
             "fp16": 61.8, "bf16": 61.8,
-            "tf32": 30.9, "fp8": 123.5,
+            "tf32": 30.9, "fp8": 247.0,
         },
     },
     "rtx_5060_ti": {
@@ -177,7 +179,7 @@ PROFILES = {
         "hbm_bw_gb": 448.0,
         "tensor_core_tflops": {
             "fp16": 47.4, "bf16": 47.4,
-            "tf32": 23.7, "fp8": 94.8,
+            "tf32": 23.7, "fp8": 189.6,
         },
     },
     "rtx_5060": {
@@ -186,7 +188,7 @@ PROFILES = {
         "hbm_bw_gb": 448.0,
         "tensor_core_tflops": {
             "fp16": 39.5, "bf16": 39.5,
-            "tf32": 19.8, "fp8": 79.0,
+            "tf32": 19.8, "fp8": 158.0,
         },
     },
 }
