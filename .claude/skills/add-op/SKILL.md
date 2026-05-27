@@ -212,11 +212,12 @@ The import chain must be: `ezops/__init__.py` triggers `kernels/__init__.py` whi
 
 ## Step 4: Create the benchmark script
 
-Create `benchmarks/bench_<op_name>.py` with two separate functions:
-`bench_correctness` for correctness checking and `bench_latency` for performance measurement.
+Create `benchmarks/bench_<op_name>.py` with a single `main()` function that combines
+correctness and latency into one table using tabulate.
 
 ```python
 import torch
+from tabulate import tabulate
 
 from ezops import <PascalCase>Op, list_backends
 from ezops.ops.utils.bench import bench_kernel
@@ -228,54 +229,45 @@ N_REPEAT = 50
 N_TRIALS = 3
 
 
-def bench_correctness():
+def _run_backend(backend, <input_data>, <ref_output>):
+    op = <PascalCase>Op(<params>, backend=backend)
+    <fresh_data> = op.gen_data()
+    op(*<input_data>)
+    max_diff = (<output> - <ref_output>).abs().max().item()
+    passed = op.check(<output>, <ref_output>)
+    ms = bench_kernel(op, args=<data_tuple>, n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
+    return max_diff, passed, ms
+
+
+def main():
     ref_op = <PascalCase>Op(<params>, backend="triton")
     <data> = ref_op.gen_data()
     ref_op._ref_forward(*<data>)
 
-    print(f"{'backend':<12} {'max_diff':>12} {'result':>10}")
-    print("-" * 36)
+    ref_ms = bench_kernel(ref_op._ref_forward, args=<data_tuple>, n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
 
+    rows = []
     for backend in BACKENDS:
         try:
-            op = <PascalCase>Op(<params>, backend=backend)
-        except Exception as e:
-            print(f"{backend:<12} {'—':>12} {'ERROR':>10}  {e}")
+            max_diff, passed, ms = _run_backend(backend, <input_data>, <ref_output>)
+            speedup = ref_ms / ms if ms > 0 else float("inf")
+            rows.append([backend, f"{max_diff:.2e}", "PASS" if passed else "FAIL", f"{ms:.4f}", f"{speedup:.2f}x"])
+        except Exception:
             continue
 
-        <fresh_data> = op.gen_data()
-        op(*<input_data>)
-
-        max_diff = (<output> - <ref_output>).abs().max().item()
-        passed = op.check(<output>, <ref_output>)
-        print(f"{backend:<12} {max_diff:>12.2e} {'PASS' if passed else 'FAIL':>10}")
-
-
-def bench_latency():
-    ref_op = <PascalCase>Op(<params>, backend="triton")
-    <data> = ref_op.gen_data()
-
-    print(f"{'backend':<12} {'latency_ms':>12}")
-    print("-" * 26)
-
-    for backend in BACKENDS:
-        try:
-            op = <PascalCase>Op(<params>, backend=backend)
-        except Exception as e:
-            print(f"{backend:<12} {'ERROR':>12}  {e}")
-            continue
-
-        ms = bench_kernel(op, args=<data_tuple>, n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
-        print(f"{backend:<12} {ms:>12.4f}")
+    rows.append(["ref", "—", "—", f"{ref_ms:.4f}", "1.00x"])
+    print(tabulate(rows, headers=["backend", "max_diff", "result", "latency(ms)", "speedup"], tablefmt="github"))
 
 
 if __name__ == "__main__":
-    bench_correctness()
-    print()
-    bench_latency()
+    main()
 ```
 
 Key conventions for the benchmark:
+- Single combined table with columns: `backend`, `max_diff`, `result`, `latency(ms)`, `speedup`.
+- `ref` row at the bottom shows PyTorch reference latency as the speedup baseline (1.00x).
+- `_run_backend` helper wraps kernel construction + execution + measurement in one function.
+- The try/except covers the entire backend run; unimplemented backends are silently skipped (no output row).
 - **Correctness** uses `op.check(output, ref_output)` which applies `torch.allclose` with the op's own `_atol` / `_rtol` defaults (inherited from `Op` base class: `1e-6` / `1e-5`). Ops can override these in `__init__` if needed.
 - **Latency** uses `bench_kernel` from `ezops.ops.utils.bench` which follows the NVIDIA SOL-ExecBench protocol: L2 cache flush before every iteration, input tensor clone pool to avoid cache effects, multiple independent trials with median selection.
 - Adapt the data unpacking and comparison to match the op's tensor signature.
