@@ -13,7 +13,6 @@ class GemvOp(Op):
     _rtol = 1e-2
 
     def __init__(self, N: int, K: int, backend: str = "triton"):
-        self.M = 1
         self.N = N
         self.K = K
         self._backend = backend
@@ -24,10 +23,10 @@ class GemvOp(Op):
         self._kernel(A, B, C)
 
     def gen_data(self):
-        A = torch.randn(self.M, self.K, device="cuda", dtype=torch.bfloat16)
-        B = torch.randn(self.K, self.N, device="cuda", dtype=torch.bfloat16)
-        C = torch.empty(self.M, self.N, device="cuda", dtype=torch.bfloat16)
+        A = torch.randn(self.K, device="cuda", dtype=torch.bfloat16)
+        B = torch.randn(self.N, self.K, device="cuda", dtype=torch.bfloat16)
+        C = torch.empty(self.N, device="cuda", dtype=torch.bfloat16)
         return A, B, C
 
     def _ref_forward(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
-        C.copy_(A @ B)
+        C.copy_(B @ A)

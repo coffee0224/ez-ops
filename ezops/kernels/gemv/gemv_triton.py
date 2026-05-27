@@ -24,9 +24,9 @@ class GemvTritonKernel(BaseKernel):
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
         assert A.is_cuda and B.is_cuda and C.is_cuda
-        assert A.shape == (1, self.K)
-        assert B.shape == (self.K, self.N)
-        assert C.shape == (1, self.N)
+        assert A.shape == (self.K,)
+        assert B.shape == (self.N, self.K)
+        assert C.shape == (self.N,)
         _, stride_bk = B.stride()
         grid = lambda meta: (1,)
         self._kernel[grid](A, B, C, self.N, self.K, stride_bk, BLOCK_SIZE=self.block_size)
