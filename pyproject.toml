@@ -25,4 +25,5 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 dev = [
     "ninja>=1.13.0",
     "pytest>=9.0.3",
+    "tabulate>=0.10.0",
 ]
