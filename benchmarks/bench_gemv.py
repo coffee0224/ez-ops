@@ -14,8 +14,8 @@ sys.path.insert(0, str(ROOT))
 from benchmarks.hardware.gpu_specs import detect_profile
 
 BACKENDS = list_backends("gemv")
-M = 4096
 N = 4096
+K = 4096
 WARMUP = 10
 N_REPEAT = 50
 N_TRIALS = 3
@@ -72,36 +72,36 @@ def _compute_sol(roofline, profile, input_bytes):
     }
 
 
-def _run_backend(backend, A, x, y_ref):
-    op = GemvOp(M=M, N=N, backend=backend)
-    _, _, y = op.gen_data()
-    op(A, x, y)
-    max_diff = (y - y_ref).abs().max().item()
-    passed = op.check(y, y_ref)
-    ms = bench_kernel(op, args=(A, x, y), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
+def _run_backend(backend, A, B, C_ref):
+    op = GemvOp(N=N, K=K, backend=backend)
+    _, _, C = op.gen_data()
+    op(A, B, C)
+    max_diff = (C - C_ref).abs().max().item()
+    passed = op.check(C, C_ref)
+    ms = bench_kernel(op, args=(A, B, C), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
     return max_diff, passed, ms
 
 
 def main():
-    ref_op = GemvOp(M=M, N=N, backend="triton")
-    A, x, y_ref = ref_op.gen_data()
-    ref_op._ref_forward(A, x, y_ref)
+    ref_op = GemvOp(N=N, K=K, backend="triton")
+    A, B, C_ref = ref_op.gen_data()
+    ref_op._ref_forward(A, B, C_ref)
     roofline = ref_op.get_roofline()
 
     ref_ms = bench_kernel(
-        ref_op._ref_forward, args=(A, x, y_ref),
+        ref_op._ref_forward, args=(A, B, C_ref),
         n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS,
     )
 
     # SOL analysis
     profile_name = _detect_gpu_profile()
     profile = _load_profile(profile_name) if profile_name else None
-    sol = _compute_sol(roofline, profile, A.nbytes + x.nbytes) if profile else None
+    sol = _compute_sol(roofline, profile, A.nbytes + B.nbytes) if profile else None
 
     rows = []
     for backend in BACKENDS:
         try:
-            max_diff, passed, ms = _run_backend(backend, A, x, y_ref)
+            max_diff, passed, ms = _run_backend(backend, A, B, C_ref)
             speedup = ref_ms / ms if ms > 0 else float("inf")
             sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
             rows.append([

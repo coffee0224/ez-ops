@@ -12,31 +12,31 @@ from ...registry import register_kernel
 
 @register_kernel("gemv", "tilelang")
 class GemvTileLangKernel(BaseKernel):
-    def __init__(self, M: int, N: int):
-        self.M = M
+    def __init__(self, N: int, K: int):
         self.N = N
+        self.K = K
         self.block_size = 1024  # TODO: tune for this op
         self._kernel = self._make_kernel()
 
     def _make_kernel(self):
-        M = self.M
         N = self.N
+        K = self.K
 
         @tilelang.jit(out_idx=[2])
         def kernel(BLOCK: int):
             @T.prim_func
             def main(
-                A: T.Buffer((M, N), "float32"),
-                x: T.Buffer((N,), "float32"),
-                y: T.Buffer((M,), "float32"),
+                A: T.Buffer((1, K), "float16"),
+                B: T.Buffer((K, N), "float16"),
+                C: T.Buffer((1, N), "float16"),
             ):
                 # TODO: implement the tilelang kernel for gemv
-                with T.Kernel(M, threads=BLOCK) as bx:
+                with T.Kernel(1, threads=BLOCK) as bx:
                     raise NotImplementedError("TODO: implement tilelang kernel for gemv")
             return main
         return kernel
 
-    def __call__(self, A: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> None:
-        assert A.is_cuda and x.is_cuda and y.is_cuda
+    def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
+        assert A.is_cuda and B.is_cuda and C.is_cuda
         # TODO: implement the call logic for gemv
         raise NotImplementedError("TODO: implement tilelang __call__ for gemv")

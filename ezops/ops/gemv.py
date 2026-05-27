@@ -5,23 +5,29 @@ from ..registry import get_kernel
 
 
 class GemvOp(Op):
-    _params_desc = {"M": "Number of rows of matrix A", "N": "Number of columns of matrix A"}
+    _params_desc = {
+        "N": "Number of columns of C",
+        "K": "Reduction dimension (A cols, B rows)",
+    }
+    _atol = 1e-2
+    _rtol = 1e-2
 
-    def __init__(self, M: int, N: int, backend: str = "triton"):
-        self.M = M
+    def __init__(self, N: int, K: int, backend: str = "triton"):
+        self.M = 1
         self.N = N
+        self.K = K
         self._backend = backend
         kernel_cls = get_kernel("gemv", backend)
-        self._kernel = kernel_cls(M=M, N=N)
+        self._kernel = kernel_cls(N=N, K=K)
 
-    def forward(self, A: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> None:
-        self._kernel(A, x, y)
+    def forward(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
+        self._kernel(A, B, C)
 
     def gen_data(self):
-        A = torch.randn(self.M, self.N, device="cuda", dtype=torch.float32)
-        x = torch.randn(self.N, device="cuda", dtype=torch.float32)
-        y = torch.empty(self.M, device="cuda", dtype=torch.float32)
-        return A, x, y
+        A = torch.randn(self.M, self.K, device="cuda", dtype=torch.bfloat16)
+        B = torch.randn(self.K, self.N, device="cuda", dtype=torch.bfloat16)
+        C = torch.empty(self.M, self.N, device="cuda", dtype=torch.bfloat16)
+        return A, B, C
 
-    def _ref_forward(self, A: torch.Tensor, x: torch.Tensor, y: torch.Tensor) -> None:
-        y.copy_(A @ x)
+    def _ref_forward(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
+        C.copy_(A @ B)
