@@ -2,19 +2,26 @@
 """Profile ez-ops kernels using NVIDIA Nsight Compute (ncu).
 
 Usage:
+  # Show available ops
+  python ncu_profile.py -h
+
+  # Show kernels and params for an op
+  python ncu_profile.py vector_add -h
+
   # Profile reference implementation only
-  python nvcc_profile.py vector_add -p n=1048576
+  python ncu_profile.py vector_add -p n=1048576
 
   # Profile specific kernels
-  python nvcc_profile.py vector_add -k triton,cuda -p n=1048576
+  python ncu_profile.py vector_add -k triton,cuda -p n=1048576
 
   # Positional params
-  python nvcc_profile.py vector_add -k ref,triton -p 1048576 -o results/
+  python ncu_profile.py vector_add -k ref,triton -p 1048576 -o results/
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import shutil
 import subprocess
 import sys
@@ -25,6 +32,74 @@ from pathlib import Path
 
 def op_name_to_class(op_name: str) -> str:
     return "".join(p.capitalize() for p in op_name.split("_")) + "Op"
+
+
+def show_help_no_op() -> None:
+    """Show usage and list all available ops."""
+    print(textwrap.dedent("""\
+        Usage: ncu_profile.py <op_name> [options]
+
+        Profile ez-ops kernels using NVIDIA Nsight Compute (ncu).
+
+        Options:
+          -k, --kernels KERNELS  Kernel backends to profile (comma-separated, default: ref)
+          -o, --output-dir DIR   Output directory (default: .profiles)
+          -p, --params PARAMS    Op constructor params: 'M=5,N=10' or '5,10,12'
+          -w, --warmup N         Warmup iterations (default: 10)
+          -h, --help             Show this help message
+    """))
+    try:
+        from ezops import list_ops
+
+        ops = list_ops()
+        if ops:
+            print("Available ops:")
+            for name in ops:
+                print(f"  {name}")
+            print(f"\nRun 'ncu_profile.py <op_name> -h' for details on a specific op.")
+        else:
+            print("No ops found.")
+    except Exception as e:
+        print(f"Could not list ops: {e}")
+
+
+def show_help_for_op(op_name: str) -> None:
+    """Show available kernels and parameter descriptions for an op."""
+    class_name = op_name_to_class(op_name)
+
+    try:
+        from ezops import list_backends
+
+        mod = importlib.import_module("ezops")
+        op_cls = getattr(mod, class_name)
+    except (ImportError, AttributeError) as e:
+        print(f"Error: unknown op {op_name!r}: {e}")
+        sys.exit(1)
+
+    print(f"Op: {op_name} ({class_name})")
+    print()
+
+    # Show kernels
+    backends = list_backends(op_name)
+    all_kernels = ["ref"] + backends
+    print("Available kernels:")
+    for k in all_kernels:
+        print(f"  {k}")
+    print()
+
+    # Show params
+    params_desc = getattr(op_cls, "_params_desc", {})
+    if params_desc:
+        print("Parameters:")
+        for name, desc in params_desc.items():
+            print(f"  {name}  {desc}")
+        print()
+        print(f"Example: -p {','.join(f'{k}=<' + k + '>' for k in params_desc)}")
+    else:
+        print("Parameters: (no description available)")
+
+    print()
+    print(f"Usage: ncu_profile.py {op_name} -k <kernels> -p <params>")
 
 
 def parse_params(params_str: str) -> tuple[list, dict]:
@@ -104,6 +179,18 @@ def warmup(op_name: str, pos_args: list, kw_args: dict, n_warmup: int):
 
 
 def main():
+    # Handle -h before argparse processes it, so we can show custom help
+    if "-h" in sys.argv or "--help" in sys.argv:
+        # Remove -h/--help from argv temporarily
+        filtered = [a for a in sys.argv[1:] if a not in ("-h", "--help")]
+        if not filtered:
+            show_help_no_op()
+        else:
+            # First non-flag argument is the op name
+            op_name = filtered[0]
+            show_help_for_op(op_name)
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(
         description="Profile ez-ops kernels using NVIDIA Nsight Compute (ncu)",
     )

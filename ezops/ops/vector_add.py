@@ -5,6 +5,8 @@ from ..registry import get_kernel
 
 
 class VectorAddOp(Op):
+    _params_desc = {"n": "Number of elements"}
+
     def __init__(self, n: int, backend: str = "triton"):
         self.n = n
         self._backend = backend

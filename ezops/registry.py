@@ -28,3 +28,7 @@ def get_kernel(op_name: str, backend: str) -> type:
 
 def list_backends(op_name: str) -> list[str]:
     return [b for (n, b) in _KERNEL_REGISTRY if n == op_name]
+
+
+def list_ops() -> list[str]:
+    return sorted({n for (n, _) in _KERNEL_REGISTRY})

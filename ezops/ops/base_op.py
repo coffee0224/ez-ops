@@ -9,6 +9,7 @@ class Op(ABC):
     _backend: str
     _atol: float = 1e-6
     _rtol: float = 1e-5
+    _params_desc: dict[str, str] = {}
 
     @abstractmethod
     def forward(self, *args, **kwargs): ...

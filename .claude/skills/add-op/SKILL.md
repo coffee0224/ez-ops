@@ -33,6 +33,8 @@ from ..registry import get_kernel
 
 
 class <PascalCase>Op(Op):
+    _params_desc = {"<param1>": "<description>", "<param2>": "<description>"}
+
     def __init__(self, <params>, backend: str = "triton"):
         # Store all problem-size parameters
         self.<params> = <params>
@@ -54,6 +56,7 @@ class <PascalCase>Op(Op):
 ```
 
 Key conventions:
+- `_params_desc` is a class-level dict mapping constructor parameter names to human-readable descriptions. Used by `scripts/ncu_profile.py -h` to show parameter info. Fill in a one-line description for each problem-size parameter.
 - Constructor stores problem-size params and instantiates the kernel via `get_kernel`.
 - `forward` delegates entirely to `self._kernel(...)`.
 - `gen_data` returns a tuple of CUDA float32 tensors. Output tensors use `torch.empty`.
