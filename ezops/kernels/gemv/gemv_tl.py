@@ -29,9 +29,9 @@ class NaiveGemvTileLangKernel(BaseKernel):
         ):
             @T.prim_func
             def main(
-                A: T.Buffer((1, K), dtype),
-                B: T.Buffer((K, N), dtype),
-                C: T.Buffer((1, N), dtype),
+                A: T.Buffer((K,), dtype),
+                B: T.Buffer((N, K), dtype),
+                C: T.Buffer((N,), dtype),
             ):
                 with T.Kernel(T.ceildiv(N, BLOCK_N)) as bn:
                     tn = T.get_thread_binding(0)  # tn = threadIdx.x
@@ -41,11 +41,11 @@ class NaiveGemvTileLangKernel(BaseKernel):
                     T.clear(C_reg)
                     for bk in T.serial(T.ceildiv(K, BLOCK_K)):
                         for tk in T.serial(BLOCK_K):
-                            A_shared[tk] = A[0, bk * BLOCK_K + tk]
-                            B_shared[tn, tk] = B[bk * BLOCK_K + tk, bn * BLOCK_N + tn]
+                            A_shared[tk] = A[bk * BLOCK_K + tk]
+                            B_shared[tn, tk] = B[bn * BLOCK_N + tn, bk * BLOCK_K + tk]
                         for tk in T.serial(BLOCK_K):
                             C_reg[0] += A_shared[tk].astype(accum_dtype) * B_shared[tn, tk].astype(accum_dtype)
-                    C[0, bn * BLOCK_N + tn] = C_reg[0]
+                    C[bn * BLOCK_N + tn] = C_reg[0]
 
             return main
 

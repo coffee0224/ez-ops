@@ -74,15 +74,20 @@ def _compute_sol(roofline, profile, input_bytes):
 
 def _run_backend(backend, A, B, C_ref):
     op = GemvOp(N=N, K=K, backend=backend)
-    _, _, C = op.gen_data()
-    op(A, B, C)
+    # Adapt shapes for kernel buffers: A(K,), B(N,K), C(N,)
+    A_ad = A.squeeze(0)
+    B_ad = B.T.contiguous()
+    C_ad = torch.empty(N, device="cuda", dtype=torch.bfloat16)
+    op(A_ad, B_ad, C_ad)
+    C = C_ad.unsqueeze(0)
     max_diff = (C - C_ref).abs().max().item()
     passed = op.check(C, C_ref)
-    ms = bench_kernel(op, args=(A, B, C), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
+    ms = bench_kernel(op, args=(A_ad, B_ad, C_ad), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
     return max_diff, passed, ms
 
 
 def main():
+    torch.manual_seed(42)
     ref_op = GemvOp(N=N, K=K, backend="triton")
     A, B, C_ref = ref_op.gen_data()
     ref_op._ref_forward(A, B, C_ref)
