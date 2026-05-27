@@ -212,21 +212,80 @@ The import chain must be: `ezops/__init__.py` triggers `kernels/__init__.py` whi
 
 ## Step 4: Create the benchmark script
 
-Create `benchmarks/bench_<op_name>.py` with a single `main()` function that combines
-correctness and latency into one table using tabulate.
+Create `benchmarks/bench_<op_name>.py` with correctness, latency, and SOL analysis.
 
 ```python
+import subprocess
+import sys
+from pathlib import Path
+
 import torch
+import yaml
 from tabulate import tabulate
 
 from ezops import <PascalCase>Op, list_backends
 from ezops.ops.utils.bench import bench_kernel
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from benchmarks.hardware.gpu_specs import detect_profile
 
 BACKENDS = list_backends("<op_name>")
 <PROBLEM_SIZE_CONFIG>
 WARMUP = 10
 N_REPEAT = 50
 N_TRIALS = 3
+
+
+def _detect_gpu_profile():
+    """Detect current GPU via nvidia-smi and return profile key."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return None
+        name = r.stdout.strip().split("\n")[0].strip()
+        return detect_profile(name)
+    except FileNotFoundError:
+        return None
+
+
+def _load_profile(profile_name):
+    """Load GPU profile YAML from assets/."""
+    path = ROOT / "assets" / f"{profile_name}.yaml"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def _compute_sol(roofline, profile, input_bytes):
+    """Compute SOL metrics from roofline result and GPU profile.
+
+    Uses tf32 tensor core peak as the FP32 compute ceiling.
+    """
+    hbm = profile.get("hbm", {})
+    tc = profile.get("tensor_core", {}).get("tf32")
+    if not hbm.get("theoretical") or not tc or not tc.get("theoretical"):
+        return None
+
+    eff_hbm = float(hbm["theoretical"]) * float(hbm.get("calibration", 1.0))
+    eff_compute = float(tc["theoretical"]) * float(tc.get("calibration", 1.0))
+
+    compute_t = roofline.flops / eff_compute
+    mem_fused_t = input_bytes / eff_hbm
+    mem_unfused_t = roofline.bytes / eff_hbm
+    theo_min = max(compute_t, mem_fused_t)
+
+    return {
+        "compute_us": compute_t * 1e6,
+        "mem_fused_us": mem_fused_t * 1e6,
+        "mem_unfused_us": mem_unfused_t * 1e6,
+        "theo_min_us": theo_min * 1e6,
+        "theo_min_s": theo_min,
+    }
 
 
 def _run_backend(backend, <input_data>, <ref_output>):
@@ -243,20 +302,50 @@ def main():
     ref_op = <PascalCase>Op(<params>, backend="triton")
     <data> = ref_op.gen_data()
     ref_op._ref_forward(*<data>)
+    roofline = ref_op.get_roofline()
 
     ref_ms = bench_kernel(ref_op._ref_forward, args=<data_tuple>, n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
+
+    # SOL analysis
+    profile_name = _detect_gpu_profile()
+    profile = _load_profile(profile_name) if profile_name else None
+    sol = _compute_sol(roofline, profile, <input_bytes>) if profile else None
 
     rows = []
     for backend in BACKENDS:
         try:
             max_diff, passed, ms = _run_backend(backend, <input_data>, <ref_output>)
             speedup = ref_ms / ms if ms > 0 else float("inf")
-            rows.append([backend, f"{max_diff:.2e}", "PASS" if passed else "FAIL", f"{ms:.4f}", f"{speedup:.2f}x"])
+            sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
+            rows.append([
+                backend, f"{max_diff:.2e}", "PASS" if passed else "FAIL",
+                f"{ms:.4f}", f"{speedup:.2f}x",
+                f"{sol_score:.1f}x" if sol_score is not None else "—",
+            ])
         except Exception:
             continue
 
-    rows.append(["ref", "—", "—", f"{ref_ms:.4f}", "1.00x"])
-    print(tabulate(rows, headers=["backend", "max_diff", "result", "latency(ms)", "speedup"], tablefmt="github"))
+    ref_sol = sol["theo_min_s"] / (ref_ms / 1000) if sol else None
+    rows.append([
+        "ref", "—", "—", f"{ref_ms:.4f}", "1.00x",
+        f"{ref_sol:.1f}x" if ref_sol is not None else "—",
+    ])
+
+    print(tabulate(
+        rows,
+        headers=["backend", "max_diff", "result", "latency(ms)", "speedup", "sol-score"],
+        tablefmt="github",
+    ))
+
+    if sol:
+        print()
+        sol_rows = [
+            ["compute time (tf32 peak)", f"{sol['compute_us']:.3f} µs"],
+            ["mem time (fused)", f"{sol['mem_fused_us']:.3f} µs"],
+            ["mem time (unfused)", f"{sol['mem_unfused_us']:.3f} µs"],
+            ["theoretical min", f"{sol['theo_min_us']:.3f} µs"],
+        ]
+        print(tabulate(sol_rows, headers=["SOL metric", "value"], tablefmt="github"))
 
 
 if __name__ == "__main__":
@@ -264,12 +353,20 @@ if __name__ == "__main__":
 ```
 
 Key conventions for the benchmark:
-- Single combined table with columns: `backend`, `max_diff`, `result`, `latency(ms)`, `speedup`.
+- Main table columns: `backend`, `max_diff`, `result`, `latency(ms)`, `speedup`, `sol-score`.
 - `ref` row at the bottom shows PyTorch reference latency as the speedup baseline (1.00x).
 - `_run_backend` helper wraps kernel construction + execution + measurement in one function.
 - The try/except covers the entire backend run; unimplemented backends are silently skipped (no output row).
 - **Correctness** uses `op.check(output, ref_output)` which applies `torch.allclose` with the op's own `_atol` / `_rtol` defaults (inherited from `Op` base class: `1e-6` / `1e-5`). Ops can override these in `__init__` if needed.
 - **Latency** uses `bench_kernel` from `ezops.ops.utils.bench` which follows the NVIDIA SOL-ExecBench protocol: L2 cache flush before every iteration, input tensor clone pool to avoid cache effects, multiple independent trials with median selection.
+- **SOL (Speed of Light)** analysis:
+  - `sol-score = theoretical_min / latency` — upper bound is 1.0 (100% of theoretical peak).
+  - `theoretical_min = max(compute_time, mem_time_fused)` — the roofline lower bound.
+  - `compute_time = flops / effective_tf32_peak` where effective = theoretical × calibration from profile YAML.
+  - `mem_time_fused = input_bytes / effective_hbm_bw` (only input tensors, output write assumed free).
+  - `mem_time_unfused = total_bytes / effective_hbm_bw` (all tensor traffic).
+  - GPU profile loaded from `assets/{profile}.yaml` (generated by `scripts/roofline_profile.py`).
+  - If no matching hardware profile is found, `sol-score` shows "—" and SOL table is skipped.
 - Adapt the data unpacking and comparison to match the op's tensor signature.
 - For ops that write in-place, compare the output tensor against `C_ref`.
 - For ops that return a value, compare the return value.
