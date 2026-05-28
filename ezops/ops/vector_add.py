@@ -7,11 +7,14 @@ from ..registry import get_kernel
 class VectorAddOp(Op):
     _params_desc = {"n": "Number of elements"}
 
-    def __init__(self, n: int, backend: str = "triton"):
+    def __init__(self, n: int, backend: str = "ref"):
         self.n = n
         self._backend = backend
-        kernel_cls = get_kernel("vector_add", backend)
-        self._kernel = kernel_cls(n=n)
+        if backend != "ref":
+            kernel_cls = get_kernel("vector_add", backend)
+            self._kernel = kernel_cls(n=n)
+        else:
+            self._kernel = self._ref_forward
 
     def forward(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
         self._kernel(A, B, C)

@@ -35,31 +35,31 @@ from ..registry import get_kernel
 class <PascalCase>Op(Op):
     _params_desc = {"<param1>": "<description>", "<param2>": "<description>"}
 
-    def __init__(self, <params>, backend: str = "triton"):
-        # Store all problem-size parameters
+    def __init__(self, <params>, backend: str = "ref"):
         self.<params> = <params>
         self._backend = backend
-        kernel_cls = get_kernel("<op_name>", backend)
-        self._kernel = kernel_cls(<params>)
+        if backend != "ref":
+            kernel_cls = get_kernel("<op_name>", backend)
+            self._kernel = kernel_cls(<params>)
+        else:
+            self._kernel = self._ref_forward
 
     def forward(self, <tensor_args>) -> <return_annotation>:
         self._kernel(<tensor_args>)
 
     def gen_data(self):
-        # Create CUDA float32 tensors with appropriate shapes
         ...
         return <tuple_of_tensors>
 
     def _ref_forward(self, <tensor_args>) -> <return_annotation>:
-        # Pure PyTorch reference — this is the "correct" implementation
         ...
 ```
 
 Key conventions:
 - `_params_desc` is a class-level dict mapping constructor parameter names to human-readable descriptions. Used by `scripts/ncu_profile.py -h` to show parameter info. Fill in a one-line description for each problem-size parameter.
-- Constructor stores problem-size params and instantiates the kernel via `get_kernel`.
+- Default `backend` is `"ref"`. When `"ref"`, `self._kernel` is set to `self._ref_forward` so `forward()` calls the PyTorch reference directly. When any other backend, `self._kernel` is instantiated via `get_kernel`.
 - `forward` delegates entirely to `self._kernel(...)`.
-- `gen_data` returns a tuple of CUDA float32 tensors. Output tensors use `torch.empty`.
+- `gen_data` returns a tuple of CUDA tensors. Output tensors use `torch.empty`.
 - `_ref_forward` is a plain PyTorch implementation — no custom kernels, no Triton.
 - If the op writes output in-place into an existing tensor (like VectorAddOp), `_ref_forward` returns `None` and uses `C.copy_(...)` or similar.
 - If the op returns a new tensor, `_ref_forward` returns it directly.
@@ -299,7 +299,7 @@ def _run_backend(backend, <input_data>, <ref_output>):
 
 
 def main():
-    ref_op = <PascalCase>Op(<params>, backend="triton")
+    ref_op = <PascalCase>Op(<params>, backend="ref")
     <data> = ref_op.gen_data()
     ref_op._ref_forward(*<data>)
     roofline = ref_op.get_roofline()

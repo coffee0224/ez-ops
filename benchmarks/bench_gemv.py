@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 from benchmarks.hardware.gpu_specs import detect_profile
 
 BACKENDS = list_backends("gemv")
+print(BACKENDS)
 N = 4096
 K = 4096
 WARMUP = 10
@@ -26,7 +27,8 @@ def _detect_gpu_profile():
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if r.returncode != 0:
             return None
@@ -84,14 +86,17 @@ def _run_backend(backend, A, B, C_ref):
 
 def main():
     torch.manual_seed(42)
-    ref_op = GemvOp(N=N, K=K, backend="triton")
+    ref_op = GemvOp(N=N, K=K, backend="ref")
     A, B, C_ref = ref_op.gen_data()
     ref_op._ref_forward(A, B, C_ref)
     roofline = ref_op.get_roofline()
 
     ref_ms = bench_kernel(
-        ref_op._ref_forward, args=(A, B, C_ref),
-        n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS,
+        ref_op._ref_forward,
+        args=(A, B, C_ref),
+        n_warmup=WARMUP,
+        n_repeat=N_REPEAT,
+        n_trials=N_TRIALS,
     )
 
     # SOL analysis
@@ -105,25 +110,38 @@ def main():
             max_diff, passed, ms = _run_backend(backend, A, B, C_ref)
             speedup = ref_ms / ms if ms > 0 else float("inf")
             sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
-            rows.append([
-                backend, f"{max_diff:.2e}", "PASS" if passed else "FAIL",
-                f"{ms:.4f}", f"{speedup:.2f}x",
-                f"{sol_score:.1f}x" if sol_score is not None else "—",
-            ])
-        except Exception:
+            rows.append(
+                [
+                    backend,
+                    f"{max_diff:.2e}",
+                    "PASS" if passed else "FAIL",
+                    f"{ms:.4f}",
+                    f"{speedup:.2f}x",
+                    f"{sol_score:.1f}x" if sol_score is not None else "—",
+                ]
+            )
+        except Exception as e:
             continue
 
     ref_sol = sol["theo_min_s"] / (ref_ms / 1000) if sol else None
-    rows.append([
-        "ref", "—", "—", f"{ref_ms:.4f}", "1.00x",
-        f"{ref_sol:.1f}x" if ref_sol is not None else "—",
-    ])
+    rows.append(
+        [
+            "ref",
+            "—",
+            "—",
+            f"{ref_ms:.4f}",
+            "1.00x",
+            f"{ref_sol:.1f}x" if ref_sol is not None else "—",
+        ]
+    )
 
-    print(tabulate(
-        rows,
-        headers=["backend", "max_diff", "result", "latency(ms)", "speedup", "sol-score"],
-        tablefmt="github",
-    ))
+    print(
+        tabulate(
+            rows,
+            headers=["backend", "max_diff", "result", "latency(ms)", "speedup", "sol-score"],
+            tablefmt="github",
+        )
+    )
 
     if sol:
         print()

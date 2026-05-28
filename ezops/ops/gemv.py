@@ -12,12 +12,15 @@ class GemvOp(Op):
     _atol = 1e-2
     _rtol = 1e-2
 
-    def __init__(self, N: int, K: int, backend: str = "triton"):
+    def __init__(self, N: int, K: int, backend: str = "ref"):
         self.N = N
         self.K = K
         self._backend = backend
-        kernel_cls = get_kernel("gemv", backend)
-        self._kernel = kernel_cls(N=N, K=K)
+        if backend != "ref":
+            kernel_cls = get_kernel("gemv", backend)
+            self._kernel = kernel_cls(N=N, K=K)
+        else:
+            self._kernel = self._ref_forward
 
     def forward(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
         self._kernel(A, B, C)
