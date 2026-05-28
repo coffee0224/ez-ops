@@ -15,11 +15,17 @@ from benchmarks.hardware.gpu_specs import detect_profile
 
 BACKENDS = list_backends("gemv")
 print(BACKENDS)
-N = 4096
-K = 4096
 WARMUP = 10
 N_REPEAT = 50
 N_TRIALS = 3
+
+WORKLOADS = [
+    # (N, K, label)
+    (4096, 1024, "qwen3-0.6B-qkv-proj"),
+    (1024, 2048, "qwen3-0.6B-o-proj"),
+    (3072, 1024, "qwen3-0.6B-up-proj"),
+    (1024, 3072, "qwen3-0.6B-down-proj"),
+]
 
 
 def _detect_gpu_profile():
@@ -74,19 +80,15 @@ def _compute_sol(roofline, profile, input_bytes):
     }
 
 
-def _run_backend(backend, A, B, C_ref):
-    op = GemvOp(N=N, K=K, backend=backend)
-    _, _, C = op.gen_data()
-    op(A, B, C)
-    max_diff = (C - C_ref).abs().max().item()
-    passed = op.check(C, C_ref)
-    ms = bench_kernel(op, args=(A, B, C), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
-    return max_diff, passed, ms
+def _run_workload(n, k, label, profile):
+    """Run all backends for a single (N, K) workload and print two tables."""
+    print(f"\n{'=' * 60}")
+    print(f"  GEMV workload: {label}  (N={n}, K={k})")
+    print(f"  A: ({k},)  B: ({n}, {k})  C: ({n},)")
+    print(f"{'=' * 60}\n")
 
-
-def main():
     torch.manual_seed(42)
-    ref_op = GemvOp(N=N, K=K, backend="ref")
+    ref_op = GemvOp(N=n, K=k, backend="ref")
     A, B, C_ref = ref_op.gen_data()
     ref_op._ref_forward(A, B, C_ref)
     roofline = ref_op.get_roofline()
@@ -99,15 +101,17 @@ def main():
         n_trials=N_TRIALS,
     )
 
-    # SOL analysis
-    profile_name = _detect_gpu_profile()
-    profile = _load_profile(profile_name) if profile_name else None
     sol = _compute_sol(roofline, profile, A.nbytes + B.nbytes) if profile else None
 
     rows = []
     for backend in BACKENDS:
         try:
-            max_diff, passed, ms = _run_backend(backend, A, B, C_ref)
+            op = GemvOp(N=n, K=k, backend=backend)
+            _, _, C = op.gen_data()
+            op(A, B, C)
+            max_diff = (C - C_ref).abs().max().item()
+            passed = op.check(C, C_ref)
+            ms = bench_kernel(op, args=(A, B, C), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
             speedup = ref_ms / ms if ms > 0 else float("inf")
             sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
             rows.append(
@@ -136,6 +140,7 @@ def main():
         ]
     )
 
+    # Table 1: Performance
     print(
         tabulate(
             rows,
@@ -144,6 +149,7 @@ def main():
         )
     )
 
+    # Table 2: SOL analysis
     if sol:
         print()
         sol_rows = [
@@ -153,6 +159,14 @@ def main():
             ["theoretical min", f"{sol['theo_min_us']:.3f} µs"],
         ]
         print(tabulate(sol_rows, headers=["SOL metric", "value"], tablefmt="github"))
+
+
+def main():
+    profile_name = _detect_gpu_profile()
+    profile = _load_profile(profile_name) if profile_name else None
+
+    for n, k, label in WORKLOADS:
+        _run_workload(n, k, label, profile)
 
 
 if __name__ == "__main__":
