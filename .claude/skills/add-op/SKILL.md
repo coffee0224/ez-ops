@@ -214,6 +214,9 @@ The import chain must be: `ezops/__init__.py` triggers `kernels/__init__.py` whi
 
 Create `benchmarks/bench_<op_name>.py` with correctness, latency, and SOL analysis.
 
+The benchmark uses a **workload** pattern: define a `WORKLOADS` list of parameter tuples with labels,
+then iterate over each workload, running all backends and printing per-workload tables.
+
 ```python
 import subprocess
 import sys
@@ -231,10 +234,15 @@ sys.path.insert(0, str(ROOT))
 from benchmarks.hardware.gpu_specs import detect_profile
 
 BACKENDS = list_backends("<op_name>")
-<PROBLEM_SIZE_CONFIG>
+print(BACKENDS)
 WARMUP = 10
 N_REPEAT = 50
 N_TRIALS = 3
+
+WORKLOADS = [
+    # (<param1>, <param2>, ..., "label"),
+    # Fill in representative workloads, e.g. from real model layer shapes.
+]
 
 
 def _detect_gpu_profile():
@@ -288,33 +296,36 @@ def _compute_sol(roofline, profile, input_bytes):
     }
 
 
-def _run_backend(backend, <input_data>, <ref_output>):
-    op = <PascalCase>Op(<params>, backend=backend)
-    <fresh_data> = op.gen_data()
-    op(*<input_data>)
-    max_diff = (<output> - <ref_output>).abs().max().item()
-    passed = op.check(<output>, <ref_output>)
-    ms = bench_kernel(op, args=<data_tuple>, n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
-    return max_diff, passed, ms
+def _run_workload(<params>, label, profile):
+    """Run all backends for a single workload and print two tables."""
+    print(f"\n{'=' * 60}")
+    print(f"  <OP_DISPLAY> workload: {label}  (<param_summary>)")
+    print(f"  <tensor_shape_summary>")
+    print(f"{'=' * 60}\n")
 
-
-def main():
+    torch.manual_seed(42)
+    # Generate data for reference
     ref_op = <PascalCase>Op(<params>, backend="ref")
     <data> = ref_op.gen_data()
     ref_op._ref_forward(*<data>)
     roofline = ref_op.get_roofline()
 
-    ref_ms = bench_kernel(ref_op._ref_forward, args=<data_tuple>, n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
+    ref_ms = bench_kernel(
+        ref_op._ref_forward, args=<data_tuple>,
+        n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS,
+    )
 
-    # SOL analysis
-    profile_name = _detect_gpu_profile()
-    profile = _load_profile(profile_name) if profile_name else None
     sol = _compute_sol(roofline, profile, <input_bytes>) if profile else None
 
     rows = []
     for backend in BACKENDS:
         try:
-            max_diff, passed, ms = _run_backend(backend, <input_data>, <ref_output>)
+            op = <PascalCase>Op(<params>, backend=backend)
+            <fresh_output> = <clone_or_empty>
+            op(<input_args>, <output_arg>)
+            max_diff = (<output> - <ref_output>).abs().max().item()
+            passed = op.check(<output>, <ref_output>)
+            ms = bench_kernel(op, args=(<bench_args>), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
             speedup = ref_ms / ms if ms > 0 else float("inf")
             sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
             rows.append([
@@ -322,7 +333,8 @@ def main():
                 f"{ms:.4f}", f"{speedup:.2f}x",
                 f"{sol_score:.1f}x" if sol_score is not None else "—",
             ])
-        except Exception:
+        except Exception as e:
+            print(e)
             continue
 
     ref_sol = sol["theo_min_s"] / (ref_ms / 1000) if sol else None
@@ -331,12 +343,14 @@ def main():
         f"{ref_sol:.1f}x" if ref_sol is not None else "—",
     ])
 
+    # Table 1: Performance
     print(tabulate(
         rows,
         headers=["backend", "max_diff", "result", "latency(ms)", "speedup", "sol-score"],
         tablefmt="github",
     ))
 
+    # Table 2: SOL analysis
     if sol:
         print()
         sol_rows = [
@@ -348,15 +362,24 @@ def main():
         print(tabulate(sol_rows, headers=["SOL metric", "value"], tablefmt="github"))
 
 
+def main():
+    profile_name = _detect_gpu_profile()
+    profile = _load_profile(profile_name) if profile_name else None
+
+    for <params>, label in WORKLOADS:
+        _run_workload(<params>, label, profile)
+
+
 if __name__ == "__main__":
     main()
 ```
 
 Key conventions for the benchmark:
+- **Workload pattern**: `WORKLOADS` is a list of tuples `(param1, param2, ..., "label")`. Each tuple contains the op constructor parameters followed by a human-readable label (e.g. model layer name). `main()` iterates over workloads and calls `_run_workload` for each.
+- Each workload gets its own performance table and SOL table, separated by a header banner showing the workload label and parameter summary.
 - Main table columns: `backend`, `max_diff`, `result`, `latency(ms)`, `speedup`, `sol-score`.
 - `ref` row at the bottom shows PyTorch reference latency as the speedup baseline (1.00x).
-- `_run_backend` helper wraps kernel construction + execution + measurement in one function.
-- The try/except covers the entire backend run; unimplemented backends are silently skipped (no output row).
+- The try/except covers the entire backend run; unimplemented backends print the exception and are skipped (no output row).
 - **Correctness** uses `op.check(output, ref_output)` which applies `torch.allclose` with the op's own `_atol` / `_rtol` defaults (inherited from `Op` base class: `1e-6` / `1e-5`). Ops can override these in `__init__` if needed.
 - **Latency** uses `bench_kernel` from `ezops.ops.utils.bench` which follows the NVIDIA SOL-ExecBench protocol: L2 cache flush before every iteration, input tensor clone pool to avoid cache effects, multiple independent trials with median selection.
 - **SOL (Speed of Light)** analysis:
@@ -367,9 +390,10 @@ Key conventions for the benchmark:
   - `mem_time_unfused = total_bytes / effective_hbm_bw` (all tensor traffic).
   - GPU profile loaded from `assets/{profile}.yaml` (generated by `scripts/roofline_profile.py`).
   - If no matching hardware profile is found, `sol-score` shows "—" and SOL table is skipped.
-- Adapt the data unpacking and comparison to match the op's tensor signature.
-- For ops that write in-place, compare the output tensor against `C_ref`.
+- Adapt the data generation, unpacking, and comparison to match the op's tensor signature.
+- For ops that write in-place, compare the output tensor against a cloned `C_ref`.
 - For ops that return a value, compare the return value.
+- Fill `WORKLOADS` with representative shapes (e.g. from real model layer dimensions) as a starting point.
 
 ## Execution order
 

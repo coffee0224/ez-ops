@@ -14,10 +14,17 @@ sys.path.insert(0, str(ROOT))
 from benchmarks.hardware.gpu_specs import detect_profile
 
 BACKENDS = list_backends("vector_add")
-N = 1 << 20
+print(BACKENDS)
 WARMUP = 10
 N_REPEAT = 50
 N_TRIALS = 3
+
+WORKLOADS = [
+    # (n, label)
+    (1 << 10, "1K"),
+    (1 << 20, "1M"),
+    (1 << 24, "16M"),
+]
 
 
 def _detect_gpu_profile():
@@ -71,18 +78,15 @@ def _compute_sol(roofline, profile, input_bytes):
     }
 
 
-def _run_backend(backend, A, B, C_ref):
-    op = VectorAddOp(n=N, backend=backend)
-    _, _, C = op.gen_data()
-    op(A, B, C)
-    max_diff = (C - C_ref).abs().max().item()
-    passed = op.check(C, C_ref)
-    ms = bench_kernel(op, args=(A, B, C), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
-    return max_diff, passed, ms
+def _run_workload(n, label, profile):
+    """Run all backends for a single workload and print two tables."""
+    print(f"\n{'=' * 60}")
+    print(f"  VectorAdd workload: {label}  (n={n})")
+    print(f"  A: ({n},)  B: ({n},)  C: ({n},)")
+    print(f"{'=' * 60}\n")
 
-
-def main():
-    ref_op = VectorAddOp(n=N, backend="triton")
+    torch.manual_seed(42)
+    ref_op = VectorAddOp(n=n, backend="ref")
     A, B, C_ref = ref_op.gen_data()
     ref_op._ref_forward(A, B, C_ref)
     roofline = ref_op.get_roofline()
@@ -92,15 +96,17 @@ def main():
         n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS,
     )
 
-    # SOL analysis
-    profile_name = _detect_gpu_profile()
-    profile = _load_profile(profile_name) if profile_name else None
     sol = _compute_sol(roofline, profile, A.nbytes + B.nbytes) if profile else None
 
     rows = []
     for backend in BACKENDS:
         try:
-            max_diff, passed, ms = _run_backend(backend, A, B, C_ref)
+            op = VectorAddOp(n=n, backend=backend)
+            _, _, C = op.gen_data()
+            op(A, B, C)
+            max_diff = (C - C_ref).abs().max().item()
+            passed = op.check(C, C_ref)
+            ms = bench_kernel(op, args=(A, B, C), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
             speedup = ref_ms / ms if ms > 0 else float("inf")
             sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
             rows.append([
@@ -108,7 +114,8 @@ def main():
                 f"{ms:.4f}", f"{speedup:.2f}x",
                 f"{sol_score:.1f}x" if sol_score is not None else "—",
             ])
-        except Exception:
+        except Exception as e:
+            print(e)
             continue
 
     ref_sol = sol["theo_min_s"] / (ref_ms / 1000) if sol else None
@@ -117,12 +124,14 @@ def main():
         f"{ref_sol:.1f}x" if ref_sol is not None else "—",
     ])
 
+    # Table 1: Performance
     print(tabulate(
         rows,
         headers=["backend", "max_diff", "result", "latency(ms)", "speedup", "sol-score"],
         tablefmt="github",
     ))
 
+    # Table 2: SOL analysis
     if sol:
         print()
         sol_rows = [
@@ -132,6 +141,14 @@ def main():
             ["theoretical min", f"{sol['theo_min_us']:.3f} µs"],
         ]
         print(tabulate(sol_rows, headers=["SOL metric", "value"], tablefmt="github"))
+
+
+def main():
+    profile_name = _detect_gpu_profile()
+    profile = _load_profile(profile_name) if profile_name else None
+
+    for n, label in WORKLOADS:
+        _run_workload(n, label, profile)
 
 
 if __name__ == "__main__":
