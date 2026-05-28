@@ -39,7 +39,16 @@ _ELEMENTWISE_OPS = [
     torch.ops.aten.minimum,
 ]
 
-_ELEMWISE_FLOP_REGISTRY = {op: _elemwise_flop for op in _ELEMENTWISE_OPS}
+def _mv_flop(*input_shapes, out_shape=None, **kwargs) -> int:
+    if len(input_shapes) >= 2 and len(input_shapes[0]) == 2:
+        return 2 * input_shapes[0][0] * input_shapes[0][1]
+    return 0
+
+
+_FLOP_REGISTRY = {
+    **{op: _elemwise_flop for op in _ELEMENTWISE_OPS},
+    torch.ops.aten.mv: _mv_flop,
+}
 
 
 @dataclass(frozen=True)
@@ -67,7 +76,7 @@ def _output_nbytes(result) -> int:
 
 
 def measure_roofline(fn, args: tuple, kwargs: dict) -> RooflineResult:
-    with FlopCounterMode(display=False, custom_mapping=_ELEMWISE_FLOP_REGISTRY) as counter:
+    with FlopCounterMode(display=False, custom_mapping=_FLOP_REGISTRY) as counter:
         result = fn(*args, **kwargs)
 
     flops = counter.get_total_flops()
