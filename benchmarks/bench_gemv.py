@@ -121,6 +121,7 @@ def main():
                 ]
             )
         except Exception as e:
+            print(e)
             continue
 
     ref_sol = sol["theo_min_s"] / (ref_ms / 1000) if sol else None

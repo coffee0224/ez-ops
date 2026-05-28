@@ -1,3 +1,4 @@
+#include <cuda_bf16.h>
 #include <tvm/ffi/tvm_ffi.h>
 
 // TODO: implement the CUDA kernel for gemv
