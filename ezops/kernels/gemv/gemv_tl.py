@@ -407,10 +407,10 @@ class AllocReducerGemvTileLangKernel(BaseKernel):
         K = self.K
 
         def get_configs():
-            block_M = [2, 4, 8, 32, 64, 128]
-            block_N = [2, 4, 8, 32, 64, 128]
-            num_stages = [0, 1, 2, 3, 4]
-            threads = [32, 64, 128, 256]
+            block_M = [32, 64, 128]
+            block_N = [32, 64, 128]
+            num_stages = [0, 1, 2]
+            threads = [32, 64, 128]
             _configs = list(itertools.product(block_M, block_N, num_stages, threads))
             return [
                 {
