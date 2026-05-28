@@ -6,5 +6,6 @@ from .gemv_tl import (
     SplitkGemvVectorizedTileLangKernel,
     SplitkGemvVectorizedTvmTileLangKernel,
     AutotuneGemvTileLangKernel,
+    AllocReducerGemvTileLangKernel,
 )  # noqa: F401
 # from .gemv_cu import GemvCudaKernel  # noqa: F401

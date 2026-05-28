@@ -392,3 +392,84 @@ class AutotuneGemvTileLangKernel(BaseKernel):
             self._best_kernel = self._kernel()
         out = self._best_kernel(A, B)
         C.copy_(out)
+
+
+@register_kernel("gemv", "alloc_reducer_gemv_tilelang")
+class AllocReducerGemvTileLangKernel(BaseKernel):
+    def __init__(self, N: int, K: int):
+        self.N = N
+        self.K = K
+        self._kernel = self._make_kernel()
+        self._best_kernel = None
+
+    def _make_kernel(self):
+        N = self.N
+        K = self.K
+
+        def get_configs():
+            block_M = [2, 4, 8, 32, 64, 128]
+            block_N = [2, 4, 8, 32, 64, 128]
+            num_stages = [0, 1, 2, 3, 4]
+            threads = [32, 64, 128, 256]
+            _configs = list(itertools.product(block_M, block_N, num_stages, threads))
+            return [
+                {
+                    "block_M": c[0],
+                    "block_N": c[1],
+                    "num_stages": c[2],
+                    "threads": c[3],
+                }
+                for c in _configs
+            ]
+
+        @autotune(
+            configs=get_configs(),
+            warmup=3,
+            rep=20,
+        )
+        @tilelang.jit(
+            pass_configs={
+                tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+                tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+            },
+        )
+        def kernel(A: T.Tensor, B: T.Tensor, block_M=None, block_N=None, num_stages=None, threads=None):
+            dtype = "bfloat16"
+            accum_dtype = "float"
+            if block_M is None or block_N is None or num_stages is None or threads is None:
+                block_M = 128
+                block_N = 128
+                num_stages = 2
+                threads = 256
+
+            A: T.Tensor((K,), dtype)
+            B: T.Tensor((N, K), dtype)
+            C = T.empty((N,), dtype)
+
+            with T.Kernel(T.ceildiv(N, block_M), threads=threads) as i0_m:
+                o_reducer = T.alloc_reducer(block_M, accum_dtype, replication="all")
+                T.clear(o_reducer)
+                for i0_n in T.Pipelined(T.ceildiv(K, block_N), num_stages=num_stages):
+                    a_smem = T.alloc_shared((block_M, block_N), dtype)
+                    T.copy(B[i0_m * block_M, i0_n * block_N], a_smem)
+                    a_frag = T.alloc_fragment((block_M, block_N), dtype)
+                    T.copy(a_smem, a_frag)
+                    x_frag = T.alloc_fragment(block_N, dtype)
+                    T.copy(A[i0_n * block_N], x_frag)
+                    for i1_m, i1_n in T.Parallel(block_M, block_N):
+                        o_reducer[i1_m] += a_frag[i1_m, i1_n].astype(accum_dtype) * x_frag[i1_n].astype(accum_dtype)
+                T.finalize_reducer(o_reducer)
+                T.copy(o_reducer, C[i0_m * block_M])
+
+            return C
+
+        return kernel
+
+    def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
+        assert A.is_cuda and B.is_cuda and C.is_cuda
+        if self._best_kernel is None:
+            # .compile() triggers autotune and returns the compiled JITKernel,
+            # bypassing the autotuner's broken eager-mode execution path.
+            self._best_kernel = self._kernel.compile(A, B)
+        out = self._best_kernel(A, B)
+        C.copy_(out)
