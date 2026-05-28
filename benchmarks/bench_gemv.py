@@ -88,30 +88,37 @@ def _run_workload(n, k, label, profile):
     print(f"{'=' * 60}\n")
 
     torch.manual_seed(42)
+    # Generate data in non-ref layout (B: [N, K]) then derive ref layout
+    A = torch.randn(k, device="cuda", dtype=torch.bfloat16)
+    B_nk = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    B_kn = B_nk.T.contiguous()
+    C = torch.empty(n, device="cuda", dtype=torch.bfloat16)
+
+    # Ref uses [K, N] layout
     ref_op = GemvOp(N=n, K=k, backend="ref")
-    A, B, C_ref = ref_op.gen_data()
-    ref_op._ref_forward(A, B, C_ref)
+    C_ref = C.clone()
+    ref_op._ref_forward(A, B_kn, C_ref)
     roofline = ref_op.get_roofline()
 
     ref_ms = bench_kernel(
         ref_op._ref_forward,
-        args=(A, B, C_ref),
+        args=(A, B_kn, C_ref),
         n_warmup=WARMUP,
         n_repeat=N_REPEAT,
         n_trials=N_TRIALS,
     )
 
-    sol = _compute_sol(roofline, profile, A.nbytes + B.nbytes) if profile else None
+    sol = _compute_sol(roofline, profile, A.nbytes + B_kn.nbytes) if profile else None
 
     rows = []
     for backend in BACKENDS:
         try:
             op = GemvOp(N=n, K=k, backend=backend)
-            _, _, C = op.gen_data()
-            op(A, B, C)
-            max_diff = (C - C_ref).abs().max().item()
-            passed = op.check(C, C_ref)
-            ms = bench_kernel(op, args=(A, B, C), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
+            C_out = C.clone()
+            op(A, B_nk, C_out)
+            max_diff = (C_out - C_ref).abs().max().item()
+            passed = op.check(C_out, C_ref)
+            ms = bench_kernel(op, args=(A, B_nk, C_out), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
             speedup = ref_ms / ms if ms > 0 else float("inf")
             sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
             rows.append(

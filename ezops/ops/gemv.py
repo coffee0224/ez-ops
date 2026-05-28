@@ -27,9 +27,12 @@ class GemvOp(Op):
 
     def gen_data(self):
         A = torch.randn(self.K, device="cuda", dtype=torch.bfloat16)
-        B = torch.randn(self.N, self.K, device="cuda", dtype=torch.bfloat16)
+        if self._backend == "ref":
+            B = torch.randn(self.K, self.N, device="cuda", dtype=torch.bfloat16)
+        else:
+            B = torch.randn(self.N, self.K, device="cuda", dtype=torch.bfloat16)
         C = torch.empty(self.N, device="cuda", dtype=torch.bfloat16)
         return A, B, C
 
     def _ref_forward(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
-        C.copy_(B @ A)
+        C.copy_(A @ B)
