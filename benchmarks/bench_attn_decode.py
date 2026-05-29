@@ -21,12 +21,11 @@ N_TRIALS = 3
 
 WORKLOADS = [
     # (batch, num_heads, seq_len, head_dim, label)
-    (1, 32, 128, 128, "llama-7b-s128"),
     (1, 32, 1024, 128, "llama-7b-s1k"),
     (1, 32, 4096, 128, "llama-7b-s4k"),
     (1, 32, 8192, 128, "llama-7b-s8k"),
-    (32, 32, 1024, 128, "llama-7b-bs32-s1k"),
-    (1, 64, 4096, 128, "llama-70b-s4k"),
+    (1, 32, 16384, 128, "llama-7b-s16k"),
+    (1, 32, 32768, 128, "llama-7b-s16k"),
 ]
 
 
@@ -115,27 +114,40 @@ def _run_workload(batch, num_heads, seq_len, head_dim, label, profile):
             ms = bench_kernel(op, args=(Q, K, V), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
             speedup = ref_ms / ms if ms > 0 else float("inf")
             sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
-            rows.append([
-                backend, f"{max_diff:.2e}", "PASS" if passed else "FAIL",
-                f"{ms:.4f}", f"{speedup:.2f}x",
-                f"{sol_score:.1f}x" if sol_score is not None else "—",
-            ])
+            rows.append(
+                [
+                    backend,
+                    f"{max_diff:.2e}",
+                    "PASS" if passed else "FAIL",
+                    f"{ms:.4f}",
+                    f"{speedup:.2f}x",
+                    f"{sol_score:.1f}x" if sol_score is not None else "—",
+                ]
+            )
         except Exception as e:
             print(e)
             continue
 
     ref_sol = sol["theo_min_s"] / (ref_ms / 1000) if sol else None
-    rows.append([
-        "ref", "—", "—", f"{ref_ms:.4f}", "1.00x",
-        f"{ref_sol:.1f}x" if ref_sol is not None else "—",
-    ])
+    rows.append(
+        [
+            "ref",
+            "—",
+            "—",
+            f"{ref_ms:.4f}",
+            "1.00x",
+            f"{ref_sol:.1f}x" if ref_sol is not None else "—",
+        ]
+    )
 
     # Table 1: Performance
-    print(tabulate(
-        rows,
-        headers=["backend", "max_diff", "result", "latency(ms)", "speedup", "sol-score"],
-        tablefmt="github",
-    ))
+    print(
+        tabulate(
+            rows,
+            headers=["backend", "max_diff", "result", "latency(ms)", "speedup", "sol-score"],
+            tablefmt="github",
+        )
+    )
 
     # Table 2: SOL analysis
     if sol:

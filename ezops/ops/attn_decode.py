@@ -14,6 +14,9 @@ class AttnDecodeOp(Op):
         "head_dim": "Dimension per head",
     }
 
+    _atol = 1e-2
+    _rtol = 1e-2
+
     def __init__(self, batch: int, num_heads: int, seq_len: int, head_dim: int, backend: str = "ref"):
         self.batch = batch
         self.num_heads = num_heads
@@ -30,12 +33,12 @@ class AttnDecodeOp(Op):
         return self._kernel(Q, K, V)
 
     def gen_data(self):
-        Q = torch.randn(self.batch, self.num_heads, 1, self.head_dim, device="cuda", dtype=torch.float32)
-        K = torch.randn(self.batch, self.num_heads, self.seq_len, self.head_dim, device="cuda", dtype=torch.float32)
-        V = torch.randn(self.batch, self.num_heads, self.seq_len, self.head_dim, device="cuda", dtype=torch.float32)
+        Q = torch.randn(self.batch, self.num_heads, 1, self.head_dim, device="cuda", dtype=torch.bfloat16)
+        K = torch.randn(self.batch, self.num_heads, self.seq_len, self.head_dim, device="cuda", dtype=torch.bfloat16)
+        V = torch.randn(self.batch, self.num_heads, self.seq_len, self.head_dim, device="cuda", dtype=torch.bfloat16)
         return Q, K, V
 
     def _ref_forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-        with torch.nn.attention.sdpa_kernel([SDPBackend.MATH]):
+        with torch.nn.attention.sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
             out = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
         return out

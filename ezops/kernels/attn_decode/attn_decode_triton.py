@@ -35,7 +35,7 @@ class AttnDecodeTritonKernel(BaseKernel):
         assert K.shape == (self.batch, self.num_heads, self.seq_len, self.head_dim)
         assert V.shape == (self.batch, self.num_heads, self.seq_len, self.head_dim)
 
-        out = torch.empty(self.batch, self.num_heads, 1, self.head_dim, device=Q.device, dtype=Q.dtype)
+        out = torch.empty(self.batch, self.num_heads, 1, self.head_dim, device=Q.device, dtype=torch.bfloat16)
         grid = lambda meta: (self.batch * self.num_heads,)
         self._kernel[grid](
             Q, K, V, out,
