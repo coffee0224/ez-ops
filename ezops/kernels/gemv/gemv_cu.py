@@ -18,6 +18,7 @@ class GemvCudaKernel(BaseKernel):
             name="gemv_cuda",
             cuda_sources=_CU_SRC.read_text(),
             functions="gemv_cu",
+            extra_cuda_cflags=["-O3", "--generate-line-info"],
         )
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:

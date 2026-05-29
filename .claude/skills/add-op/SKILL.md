@@ -152,6 +152,7 @@ class <PascalCase>CudaKernel(BaseKernel):
             name="<op_name>_cuda",
             cuda_sources=_CU_SRC.read_text(),
             functions="<op_name>_cu",
+            extra_cuda_cflags=["-O3", "--generate-line-info"],
         )
 
     def __call__(self, <tensor_args>) -> None:
