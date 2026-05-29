@@ -8,4 +8,4 @@ from .gemv_tl import (
     AutotuneGemvTileLangKernel,
     AllocReducerGemvTileLangKernel,
 )  # noqa: F401
-# from .gemv_cu import GemvCudaKernel  # noqa: F401
+from .gemv_cu import GemvCudaKernel  # noqa: F401
