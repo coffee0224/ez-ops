@@ -1,3 +1,4 @@
+import torch
 from pathlib import Path
 
 from tvm_ffi import cpp
@@ -23,5 +24,6 @@ class AttnDecodeCudaKernel(BaseKernel):
         )
 
     def __call__(self, Q, K, V):
-        # TODO: implement the cuda call for attn_decode
-        raise NotImplementedError("TODO: implement cuda __call__ for attn_decode")
+        out = torch.empty_like(Q)
+        self._mod.attn_decode_cu(Q, K, V, out)
+        return out
