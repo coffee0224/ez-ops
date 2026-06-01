@@ -28,7 +28,26 @@ def _detect_gpu():
     compute_cap = f"{props.major}.{props.minor}"
     arch = f"sm_{props.major * 10 + props.minor}"
     profile = detect_profile(name)
-    return name, compute_cap, arch, profile
+
+    sm_count = props.multi_processor_count
+    l2_cache_bytes = getattr(props, "L2_cache_size", None)
+
+    # Shared memory per SM: try CUDA driver API via ctypes
+    shared_mem_per_sm = None
+    try:
+        import ctypes
+        cuda = ctypes.CDLL("libcuda.so.1")
+        if cuda.cuInit(0) == 0:
+            device = ctypes.c_int()
+            if cuda.cuDeviceGet(ctypes.byref(device), 0) == 0:
+                value = ctypes.c_int()
+                # CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR = 81
+                if cuda.cuDeviceGetAttribute(ctypes.byref(value), 81, device) == 0:
+                    shared_mem_per_sm = value.value
+    except Exception:
+        pass
+
+    return name, compute_cap, arch, profile, sm_count, l2_cache_bytes, shared_mem_per_sm
 
 
 def _fmt_bytes(gbs):
@@ -48,7 +67,8 @@ def _fmt_flops(tflops):
     return f"{coeff:.1f}e12"
 
 
-def generate_yaml(gpu_name, compute_cap, hbm_result, compute_results, specs):
+def generate_yaml(gpu_name, compute_cap, sm_count, l2_cache_bytes,
+                   shared_mem_per_sm, hbm_result, compute_results, specs):
     """Generate profile YAML string."""
     lines = [
         f"# GPU Profile: {gpu_name}",
@@ -60,7 +80,17 @@ def generate_yaml(gpu_name, compute_cap, hbm_result, compute_results, specs):
         f"gpu: {gpu_name}",
         f"compute_capability: {compute_cap}",
         "",
+        f"sm_count: {sm_count}",
     ]
+
+    if l2_cache_bytes is not None:
+        l2_mb = l2_cache_bytes / (1024 * 1024)
+        lines.append(f"l2_cache_size: {l2_cache_bytes}          # {l2_mb:.0f} MB")
+    if shared_mem_per_sm is not None:
+        smem_kb = shared_mem_per_sm / 1024
+        lines.append(f"shared_memory_per_sm: {shared_mem_per_sm}       # {smem_kb:.0f} KB")
+
+    lines.append("")
 
     # HBM
     lines.append("hbm:")
@@ -126,12 +156,17 @@ def main():
     from benchmarks.hardware.memory.hbm_bandwidth import run as run_hbm
 
     # Detect GPU
-    gpu_name, compute_cap, arch, profile = _detect_gpu()
+    gpu_name, compute_cap, arch, profile, sm_count, l2_cache_bytes, shared_mem_per_sm = _detect_gpu()
     specs = get_specs(profile) if profile else None
 
     print(f"GPU: {gpu_name}")
     print(f"Profile: {profile or 'unknown'}")
     print(f"Compute capability: {compute_cap}")
+    print(f"SM count: {sm_count}")
+    if l2_cache_bytes is not None:
+        print(f"L2 cache: {l2_cache_bytes / (1024 * 1024):.0f} MB")
+    if shared_mem_per_sm is not None:
+        print(f"Shared memory per SM: {shared_mem_per_sm / 1024:.0f} KB")
     print()
 
     if not profile:
@@ -189,7 +224,8 @@ def main():
     print("Generating profile YAML")
     print("=" * 60)
 
-    yaml_str = generate_yaml(gpu_name, compute_cap, hbm_result, compute_results, specs)
+    yaml_str = generate_yaml(gpu_name, compute_cap, sm_count, l2_cache_bytes,
+                             shared_mem_per_sm, hbm_result, compute_results, specs)
 
     filename = f"{profile or gpu_name.lower().replace(' ', '_')}.yaml"
     output_path = Path(args.output_dir) / filename

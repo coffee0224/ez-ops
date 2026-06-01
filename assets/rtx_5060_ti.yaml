@@ -7,9 +7,13 @@
 gpu: NVIDIA GeForce RTX 5060 Ti
 compute_capability: 12.0
 
+sm_count: 36
+l2_cache_size: 33554432          # 32 MB
+shared_memory_per_sm: 102400       # 100 KB
+
 hbm:
   theoretical: 448e9        # bytes/s, spec sheet
-  calibration: 0.846         # STREAM Triad
+  calibration: 0.845         # STREAM Triad
 
 tensor_core:
   bf16:
