@@ -13,6 +13,7 @@ Outputs:
 """
 
 import argparse
+import datetime
 import json
 import os
 
@@ -24,6 +25,7 @@ from analyze_ncu import (
     classify_bottleneck,
     compute_bandwidth_analysis,
     detect_gpu,
+    append_to_log,
 )
 
 
@@ -169,7 +171,9 @@ def main():
     parser.add_argument("--tag2", required=True, help="Label for optimized")
     parser.add_argument("--kernel-name", default=None,
                         help="Kernel name to compare (substring match)")
-    parser.add_argument("--output", default=".", help="Output directory")
+    parser.add_argument("--kernel", default=None,
+                        help="Op name for optimization log. When set, appends to <output>/<kernel>_opt_log.md")
+    parser.add_argument("--output", default=".profiles", help="Output directory (default: .profiles)")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -208,6 +212,38 @@ def main():
 
     # Print summary
     print(f"\n{report_text}")
+
+    # Append to optimization log
+    if args.kernel:
+        dur1 = metrics1.get("Duration (ns)")
+        dur2 = metrics2.get("Duration (ns)")
+        speedup = dur1 / dur2 if dur1 and dur2 and dur2 > 0 else None
+
+        ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+        log_lines = [
+            f"### Compare: {args.tag1} vs {args.tag2} ({ts})\n",
+        ]
+        if speedup:
+            dur_change = (dur2 - dur1) / dur1 * 100
+            log_lines.append(f"- Duration: {dur1/1000:.2f} -> {dur2/1000:.2f} us "
+                             f"({dur_change:+.1f}%, **{speedup:.3f}x**)")
+        if bw1 and bw2 and bw1.get('bw_utilization_pct') and bw2.get('bw_utilization_pct'):
+            log_lines.append(f"- BW util: {bw1['bw_utilization_pct']:.1f}% -> {bw2['bw_utilization_pct']:.1f}%")
+        if bn1['classification'] != bn2['classification']:
+            log_lines.append(f"- Bottleneck: {bn1['classification']} -> {bn2['classification']}")
+        log_lines.append("")
+
+        log_path = os.path.join(args.output, f"{args.kernel}_opt_log.md")
+        if not os.path.exists(log_path):
+            gpu_name = detect_gpu()
+            with open(log_path, "w") as f:
+                f.write(f"# Optimization Log: {args.kernel}\n\n")
+                f.write(f"- GPU: {gpu_name or 'unknown'}\n")
+                f.write(f"- Created: {datetime.datetime.now().strftime('%Y-%m-%d')}\n\n")
+
+        with open(log_path, "a") as f:
+            f.write("\n".join(log_lines) + "\n")
+        print(f"Appended to log: {log_path}")
 
 
 if __name__ == "__main__":

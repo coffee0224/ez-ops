@@ -77,20 +77,17 @@ Then import the class in `ezops/kernels/<op_name>/__init__.py` so the decorator 
    git checkout -b opt/<kernel_name>_<timestamp>
    ```
 
-2. **Create the trace file** at `.trace/<kernel_name>.md`:
-   ```markdown
-   # Optimization Trace: <kernel_name>
+2. **Record the goal**: what metric are we optimizing (latency, throughput, SOL score)?
 
-   ## Configuration
-   - Baseline: <baseline_backend>
-   - DSL constraint: <dsl or "any">
-   - Optimization direction: <direction or "auto">
-   - GPU: <detected from nvidia-smi>
-
-   ## Iterations
+3. **Run the first NCU analysis with `--kernel`** — this auto-creates the optimization log at `.profiles/<kernel>_opt_log.md`:
+   ```bash
+   python <skill-path>/scripts/analyze_ncu.py \
+     --report .profiles/<report>.ncu-rep \
+     --tag baseline \
+     --kernel-name <kernel_name_substring> \
+     --kernel <kernel>
    ```
-
-3. **Record the goal**: what metric are we optimizing (latency, throughput, SOL score)?
+   The `--kernel` flag triggers log creation and appending. Every subsequent analyze/compare run with `--kernel` appends an iteration record.
 
 ### Phase 1: Establish Baseline
 
@@ -293,49 +290,59 @@ The optimization loop uses sub-agents to keep context clean. Here's why and how:
 - Performance numbers (if correct)
 - Brief description of what was implemented
 
-The main agent NEVER lets a sub-agent commit code or modify the trace file — that's the main agent's responsibility.
+The main agent NEVER lets a sub-agent commit code or modify the optimization log — that's the main agent's responsibility.
 
-## Trace File Format
+## Optimization Log
 
-The trace file at `.trace/<kernel_name>.md` is the optimization log. It captures everything so that:
-- The user can review what happened
-- Future sessions can build on past work
-- Failed attempts are documented to avoid repetition
+The optimization log lives at `.profiles/<kernel>_opt_log.md`, auto-created on the first `analyze_ncu.py` run with `--kernel <name>`. It accumulates iteration records automatically:
 
-### Template
-
-```markdown
-# Optimization Trace: <kernel_name>
-
-## Configuration
-- Baseline: <backend>
-- DSL: <dsl>
-- Direction: <direction>
-- GPU: <gpu_name>
-- Date: <date>
-
-## Baseline Metrics
-- Latency: <X> us
-- SOL Score: <Y>%
-- Key bottleneck: <from NCU analysis>
-- NCU report: <.profiles/filename>
-
-## Iteration 1: <strategy_name>
-- Backend name: <new_backend>
-- Strategy: <description>
-- Implementation: <files created/modified>
-- Correctness: PASS / FAIL
-- Latency: <X> us (baseline: <Y> us)
-- Change: <+/- %>%
-- Verdict: ADOPTED / REJECTED
-- NCU comparison: <key metric changes>
-- Errors made: <any bugs or mistakes during implementation>
-- NCU report: <.profiles/filename>
-
-## Iteration 2: ...
+```
+.profiles/
+├── gemv_ws_cuda_20260602_001747.ncu-rep   # raw NCU report
+├── metrics_key_baseline.json               # extracted metrics
+├── metrics_key_baseline.txt                # human-readable report
+├── compare_baseline_vs_optimized.txt       # comparison report
+└── gemv_opt_log.md                         # optimization log (auto-created)
 ```
 
-Every iteration gets an entry, even failed ones. The "Errors made" field is important — it helps avoid repeating the same mistakes.
+### How it gets populated
+
+- `analyze_ncu.py --kernel <name>`: appends a section with duration, BW utilization, bottleneck classification, top stall, NCU report filename
+- `compare_ncu.py --kernel <name>`: appends a comparison section with speedup, BW util change, bottleneck shift
+- The main agent may manually append extra context (strategy description, correctness result, errors) between script runs
+
+### Auto-generated format example
+
+```markdown
+# Optimization Log: gemv
+
+- Kernel: gemv_ws_kernel
+- GPU: NVIDIA GeForce RTX 5060 Ti
+- Created: 2026-06-02
+
+## baseline (2026-06-02 00:17)
+
+- Duration: **35.65 us**
+- Effective BW: 503.8 GB/s (133.1% util)
+- Bottleneck: MEMORY_BANDWIDTH_SATURATED
+- Top stall: Stall Long Scoreboard % = 15.2%
+- NCU report: `gemv_ws_cuda_20260531_213552.ncu-rep`
+
+### Compare: baseline vs optimized (2026-06-02 01:30)
+
+- Duration: 35.65 -> 23.42 us (-34.3%, **1.522x**)
+- BW util: 133.1% -> 97.9%
+
+## optimized (2026-06-02 01:30)
+
+- Duration: **23.42 us**
+- Effective BW: 370.5 GB/s (97.9% util)
+- Bottleneck: MEMORY_BANDWIDTH_SATURATED
+- Top stall: None = 0.0%
+- NCU report: `gemv_ws_cuda_20260602_001747.ncu-rep`
+```
+
+Every iteration gets an entry, even failed ones.
 
 ## NCU Report Analysis
 
@@ -356,11 +363,10 @@ python <skill-path>/scripts/analyze_ncu.py \
 python <skill-path>/scripts/analyze_ncu.py \
   --report .profiles/<report>.ncu-rep \
   --tag <tag> \
-  --kernel-name <kernel_name_substring> \
-  --output .trace/<kernel_name>/
+  --kernel-name <kernel_name_substring>
 ```
 
-Outputs per report:
+Outputs go to `.profiles/` by default (same directory as the `.ncu-rep` files):
 - `metrics_key_<tag>.json` — all metrics + bandwidth analysis + bottleneck classification (machine-readable)
 - `metrics_key_<tag>.txt` — human-readable summary with timing, BW utilization, throughput, launch config, stalls, and recommendations
 - `analysis_<tag>.txt` — same as the .txt report
@@ -370,11 +376,10 @@ Outputs per report:
 python <skill-path>/scripts/compare_ncu.py \
   --report1 .profiles/<baseline>.ncu-rep --tag1 baseline \
   --report2 .profiles/<new>.ncu-rep --tag2 optimized \
-  --kernel-name <kernel_name_substring> \
-  --output .trace/<kernel_name>/
+  --kernel-name <kernel_name_substring>
 ```
 
-The comparison shows side-by-side timing, memory bandwidth (effective BW, BW utilization %, LTS data volume), throughput SOL%, launch config, stall reasons, and bottleneck classification shifts.
+Comparison outputs also go to `.profiles/` by default. Shows side-by-side timing, memory bandwidth (effective BW, BW utilization %, LTS data volume), throughput SOL%, launch config, stall reasons, and bottleneck classification shifts.
 
 ### Script API (for programmatic use)
 

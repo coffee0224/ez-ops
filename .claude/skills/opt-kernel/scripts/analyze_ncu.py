@@ -12,6 +12,7 @@ Outputs:
 """
 
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -439,6 +440,58 @@ def format_report(kernel_name, gpu_name, tag, metrics, bw_analysis, bottleneck, 
 
 
 # ---------------------------------------------------------------------------
+# Optimization log
+# ---------------------------------------------------------------------------
+
+def append_to_log(output_dir, kernel, tag, kernel_name, gpu_name,
+                  metrics, bw_analysis, bottleneck, recs, report_path):
+    """Append an iteration summary to .profiles/<kernel>_opt_log.md.
+
+    Creates the log with a header on first call, appends on subsequent calls.
+    """
+    log_path = os.path.join(output_dir, f"{kernel}_opt_log.md")
+
+    if not os.path.exists(log_path):
+        with open(log_path, "w") as f:
+            f.write(f"# Optimization Log: {kernel}\n\n")
+            f.write(f"- Kernel: {kernel_name}\n")
+            f.write(f"- GPU: {gpu_name or 'unknown'}\n")
+            f.write(f"- Created: {datetime.datetime.now().strftime('%Y-%m-%d')}\n\n")
+
+    ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    lines = [f"## {tag} ({ts})\n"]
+
+    dur_ns = metrics.get("Duration (ns)")
+    if dur_ns:
+        lines.append(f"- Duration: **{dur_ns/1000:.2f} us**")
+
+    if bw_analysis:
+        bw_line = f"- Effective BW: {bw_analysis['effective_bw_gbs']:.1f} GB/s"
+        if bw_analysis.get('bw_utilization_pct') is not None:
+            bw_line += f" ({bw_analysis['bw_utilization_pct']:.1f}% util)"
+        lines.append(bw_line)
+
+    lines.append(f"- Bottleneck: {bottleneck['classification']}")
+    top = bottleneck['top_stall']
+    lines.append(f"- Top stall: {top['reason']} = {top['pct']:.1f}%")
+
+    if report_path:
+        lines.append(f"- NCU report: `{os.path.basename(report_path)}`")
+
+    if recs:
+        lines.append("- Recommendations:")
+        for r in recs[:3]:
+            lines.append(f"  - {r}")
+
+    lines.append("")
+
+    with open(log_path, "a") as f:
+        f.write("\n".join(lines) + "\n")
+
+    return log_path
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -452,7 +505,9 @@ def main():
                              "Auto-selects longest-duration kernel if omitted.")
     parser.add_argument("--list-kernels", action="store_true",
                         help="List all kernels in the report and exit.")
-    parser.add_argument("--output", default=".", help="Output directory")
+    parser.add_argument("--kernel", default=None,
+                        help="Op name for optimization log. When set, appends to <output>/<kernel>_opt_log.md")
+    parser.add_argument("--output", default=".profiles", help="Output directory (default: .profiles)")
     args = parser.parse_args()
 
     # List kernels mode
@@ -514,6 +569,13 @@ def main():
 
     # Print summary
     print(f"\n{report_text}")
+
+    # Append to optimization log
+    if args.kernel:
+        log_path = append_to_log(
+            args.output, args.kernel, args.tag, kernel_name, gpu_name,
+            metrics, bw_analysis, bottleneck, recommendations, args.report)
+        print(f"Appended to log: {log_path}")
 
 
 if __name__ == "__main__":
