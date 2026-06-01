@@ -113,14 +113,29 @@ This generates a `.ncu-rep` file in `.profiles/`. Note the filename.
 
 Read the `.ncu-rep` file using the bundled `scripts/analyze_ncu.py` helper:
 ```bash
+# List kernels in the report to find the target kernel
+python <skill-path>/scripts/analyze_ncu.py --report .profiles/<report>.ncu-rep --tag baseline --list-kernels
+
+# Analyze a specific kernel by name (recommended)
+python <skill-path>/scripts/analyze_ncu.py \
+  --report .profiles/<report>.ncu-rep \
+  --tag baseline \
+  --kernel-name <kernel_name_substring>
+
+# Without --kernel-name, auto-selects the longest-duration kernel (may pick wrong one if report contains helper kernels)
 python <skill-path>/scripts/analyze_ncu.py --report .profiles/<report>.ncu-rep --tag baseline
 ```
 
-This extracts key metrics: SM throughput, memory throughput, occupancy, stall reasons, SOL percentages, and more. The analysis will reveal whether the kernel is:
-- **Memory-bound**: Low SM compute throughput, high memory utilization, stalls on scoreboard
+NCU reports often contain multiple kernels (e.g. PyTorch data generation kernels). **Always use `--list-kernels` first** to see what's in the report, then use `--kernel-name` to select the target. The auto-select mode picks the longest single-kernel duration, which can be misleading when helper kernels run sequentially.
+
+The analysis extracts key metrics and classifies the bottleneck:
+- **MEMORY_BANDWIDTH_SATURATED**: BW utilization > 80%, near peak HBM throughput
+- **Memory-bound**: High memory throughput, low SM utilization, stalls on scoreboard
 - **Compute-bound**: High SM utilization, memory underutilized, stalls on math pipe throttle
-- **Latency-bound**: Low occupancy, many "not selected" or "dispatch" stalls
+- **Occupancy-bound**: Low BW utilization and low SM throughput, insufficient parallelism
 - **Balanced**: Neither resource fully saturated
+
+The report also computes effective memory bandwidth from LTS sectors and compares it against GPU peak (auto-detected via nvidia-smi).
 
 Read `references/ncu_metrics.md` for detailed metric explanations.
 
@@ -328,20 +343,54 @@ Every iteration gets an entry, even failed ones. The "Errors made" field is impo
 
 The skill bundles two helper scripts for NCU analysis:
 
-**Analyze a single report:**
+**List kernels in a report** (always do this first):
 ```bash
 python <skill-path>/scripts/analyze_ncu.py \
   --report .profiles/<report>.ncu-rep \
   --tag <tag> \
+  --list-kernels
+```
+
+**Analyze a single report** (use `--kernel-name` to select target kernel):
+```bash
+python <skill-path>/scripts/analyze_ncu.py \
+  --report .profiles/<report>.ncu-rep \
+  --tag <tag> \
+  --kernel-name <kernel_name_substring> \
   --output .trace/<kernel_name>/
 ```
+
+Outputs per report:
+- `metrics_key_<tag>.json` — all metrics + bandwidth analysis + bottleneck classification (machine-readable)
+- `metrics_key_<tag>.txt` — human-readable summary with timing, BW utilization, throughput, launch config, stalls, and recommendations
+- `analysis_<tag>.txt` — same as the .txt report
 
 **Compare two reports:**
 ```bash
 python <skill-path>/scripts/compare_ncu.py \
   --report1 .profiles/<baseline>.ncu-rep --tag1 baseline \
   --report2 .profiles/<new>.ncu-rep --tag2 optimized \
+  --kernel-name <kernel_name_substring> \
   --output .trace/<kernel_name>/
+```
+
+The comparison shows side-by-side timing, memory bandwidth (effective BW, BW utilization %, LTS data volume), throughput SOL%, launch config, stall reasons, and bottleneck classification shifts.
+
+### Script API (for programmatic use)
+
+The `analyze_ncu.py` module exposes these functions for import by other scripts:
+
+```python
+from analyze_ncu import (
+    load_action,           # (report_path, kernel_name=None) -> action
+    _metric_vals,          # (action, [(friendly, ncu_name), ...]) -> dict
+    _metric_val,           # (action, ncu_name) -> float|None
+    ALL_METRIC_GROUPS,     # list of metric group lists
+    compute_bandwidth_analysis,  # (metrics, gpu_name) -> dict|None
+    classify_bottleneck,   # (metrics, bw_analysis) -> dict
+    detect_gpu,            # () -> str|None
+    list_kernels,          # (report_path) -> [(name, range_idx, action_idx)]
+)
 ```
 
 ### Manual Analysis Guide
@@ -353,14 +402,20 @@ If the helpers aren't available or you need deeper analysis, read the NCU report
    - `gpu__time_duration.sum` — total kernel time
    - `sm__throughput.avg.pct_of_peak_sustained_elapsed` — SM utilization
    - `lts__throughput.avg.pct_of_peak_sustained_elapsed` — memory throughput
+   - `lts__t_sectors.sum` — LTS sectors (multiply by 32 for bytes transferred)
    - `launch__waves_per_multiprocessor` — occupancy indicator
-   - `smsp__warps_active.avg.pct_of_peak` — warp occupancy
    - Stall metrics: `smsp__issue_active.avg.pct_of_peak...stalled_*` — why warps stall
 
-3. **Diagnosis pattern**:
-   - If SM throughput > 80%: compute-bound (focus on compute optimization)
-   - If memory throughput > 80%: memory-bound (focus on memory access patterns)
-   - If both < 50%: occupancy/latency bound (focus on launch config, synchronization)
+3. **Bandwidth calculation**:
+   - Effective BW = (LTS sectors × 32) / duration
+   - Compare against GPU peak BW × calibration factor (e.g. RTX 5060 Ti: 448 × 0.845 = 378.6 GB/s)
+   - BW utilization > 80% means memory-bandwidth saturated, minimal headroom
+
+4. **Diagnosis pattern**:
+   - If BW utilization > 80%: memory-bandwidth saturated (focus on reducing bytes transferred)
+   - If LTS throughput > 60% and SM < 50%: memory-bound (focus on access patterns)
+   - If SM throughput > 60%: compute-bound (focus on compute optimization)
+   - If BW util < 50% and SM < 30%: occupancy-bound (focus on launch config, synchronization)
    - Top stall reason tells you what to fix first
 
 ### External NCU Analysis Resources
@@ -464,7 +519,10 @@ When the NCU report reveals a bottleneck, consult `references/optimization_strat
 ```
 NCU Analysis Results
 │
-├─ Memory-bound (high memory throughput, low SM utilization)
+├─ Memory-bandwidth saturated (BW utilization > 80%)
+│  └─ Near peak HBM throughput — focus on reducing total bytes transferred
+│
+├─ Memory-bound (high LTS throughput, low SM utilization)
 │  ├─ Low bandwidth utilization → Vectorized loads (uint4/float4)
 │  ├─ Cache miss rate high → Data prefetch, shared memory tiling
 │  ├─ Uncoalesced accesses → Relayout or restructure access pattern
