@@ -21,7 +21,7 @@ class GemvWsCudaKernel(BaseKernel):
             extra_cuda_cflags=[
                 "-O3",
                 "--generate-line-info",
-                "-arch=sm_90a",
+                "-arch=sm_120a",
             ],
             extra_ldflags=[
                 "-L/usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs",

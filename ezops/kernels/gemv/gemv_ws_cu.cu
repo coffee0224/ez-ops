@@ -6,13 +6,10 @@
 // Constants
 // ---------------------------------------------------------------------------
 constexpr int WARP_SIZE = 32;
-constexpr int BLOCK_SIZE = 288;  // 9 warps: 1 DMA + 8 compute
-constexpr int NUM_WARPS = BLOCK_SIZE / WARP_SIZE;
+constexpr int COMPUTE_WARPS = 8;
 constexpr int DMA_WARPS = 1;
-constexpr int COMPUTE_WARPS = NUM_WARPS - DMA_WARPS;  // 8
+constexpr int BLOCK_SIZE = (COMPUTE_WARPS + DMA_WARPS) * WARP_SIZE;  // 288
 constexpr int TILE_K = 256;
-constexpr int NUM_STAGES = 2;
-constexpr int CP16B_ELEMS = 8;
 
 // ---------------------------------------------------------------------------
 // cp.async.cg helpers (for A loading)
@@ -93,17 +90,14 @@ __device__ __forceinline__ void cp_async_bulk_tensor_2d(
 }
 
 // ---------------------------------------------------------------------------
-// Persistent warp-specialized GEMV kernel (TMA + mbarrier_wait)
+// Persistent warp-specialized GEMV kernel
 //   C[N] = A[K] @ B[N,K]
 //
 // Warp 0: DMA producer (loads A via cp.async.cg, B via TMA)
 // Warps 1-8: Compute consumers (each warp handles one row)
 //
-// Sync model:
-//   - Compute warps call mbarrier_wait(mb[cur_buf]) to wait for TMA data.
-//   - DMA thread fires TMA (expect_tx + issue) without waiting for completion.
-//   - __syncthreads() at the bottom prevents DMA from getting too far ahead.
-//   - Overlap: TMA for nxt_buf runs in background while compute works on cur_buf.
+// Single-buffered: each row group loads all K tiles via TMA, compute waits,
+// then does full dot product. No double buffering — simpler, less shared memory.
 // ---------------------------------------------------------------------------
 __global__ void __launch_bounds__(288, 1)
 gemv_ws_kernel(
@@ -125,33 +119,30 @@ gemv_ws_kernel(
   size_t s_A_bytes = (size_t)K * sizeof(__nv_bfloat16);
   size_t s_A_aligned = (s_A_bytes + 127) & ~(size_t)127;
 
-  __nv_bfloat16* s_B_base = reinterpret_cast<__nv_bfloat16*>(smem_raw + s_A_aligned);
-  __nv_bfloat16* s_B_buf[NUM_STAGES] = {
-      s_B_base,
-      s_B_base + COMPUTE_WARPS * TILE_K,
-  };
+  // Single buffer for B: COMPUTE_WARPS rows × K columns
+  __nv_bfloat16* s_B = reinterpret_cast<__nv_bfloat16*>(smem_raw + s_A_aligned);
 
-  size_t s_B_bytes = NUM_STAGES * COMPUTE_WARPS * TILE_K * sizeof(__nv_bfloat16);
+  size_t s_B_bytes = COMPUTE_WARPS * K * sizeof(__nv_bfloat16);
   size_t mb_offset = (s_A_aligned + s_B_bytes + 7) & ~(size_t)7;
   mbarrier_t* mb = reinterpret_cast<mbarrier_t*>(smem_raw + mb_offset);
 
   int num_blocks = gridDim.x;
   int total_row_groups = (N + COMPUTE_WARPS - 1) / COMPUTE_WARPS;
+  uint32_t tile_bytes = COMPUTE_WARPS * TILE_K * sizeof(__nv_bfloat16);
 
-  // ---- Init mbarriers ----
+  // ---- Init mbarrier ----
   if (threadIdx.x == 0) {
     mbarrier_init(&mb[0], 1);
-    mbarrier_init(&mb[1], 1);
   }
   __syncthreads();
 
   // ---- Phase 1: Load A into smem (cp.async.cg) ----
   if (is_dma) {
-    int tile_16B = K / CP16B_ELEMS;
+    int tile_16B = K / 8;
     for (int i = lane_id; i < tile_16B; i += WARP_SIZE) {
       uint32_t smem_addr = static_cast<uint32_t>(
-          __cvta_generic_to_shared(s_A + i * CP16B_ELEMS));
-      CP_ASYNC_CG(smem_addr, A + i * CP16B_ELEMS);
+          __cvta_generic_to_shared(s_A + i * 8));
+      CP_ASYNC_CG(smem_addr, A + i * 8);
     }
     CP_ASYNC_COMMIT_GROUP();
     cp_async_wait_group_0();
@@ -159,77 +150,58 @@ gemv_ws_kernel(
   }
   __syncthreads();
 
-  // ---- Prologue: TMA load first B tile (fire and forget) ----
-  if (threadIdx.x == 0 && num_tiles_k > 0 && blockIdx.x < total_row_groups) {
-    int row_base = blockIdx.x * COMPUTE_WARPS;
-    uint32_t tile_bytes = COMPUTE_WARPS * TILE_K * sizeof(__nv_bfloat16);
-    mbarrier_expect_tx(&mb[0], tile_bytes);
-    cp_async_bulk_tensor_2d(
-        &mb[0], &tma_B, s_B_buf[0],
-        /*coord_fast=*/0, /*coord_slow=*/row_base);
-  }
-
-  // ---- Phase 2: Persistent pipeline ----
-  uint32_t compute_phase[2] = {0, 0};
+  // ---- Phase 2: Persistent loop ----
+  uint32_t phase = 0;
+  constexpr int PAIRS = TILE_K / (2 * WARP_SIZE);  // 4
 
   for (int rg = blockIdx.x; rg < total_row_groups; rg += num_blocks) {
     int row_base = rg * COMPUTE_WARPS;
     int my_row = row_base + comp_idx;
-    float acc = 0.0f;
 
-    for (int k_tile = 0; k_tile < num_tiles_k; k_tile++) {
-      int cur_buf = k_tile & 1;
-      int nxt_buf = cur_buf ^ 1;
-
-      // Compute warps: wait for TMA data in cur_buf
-      if (!is_dma) {
-        mbarrier_wait(&mb[cur_buf], compute_phase[cur_buf]);
-        compute_phase[cur_buf] ^= 1;
+    // DMA: issue all TMA tiles for this row group
+    if (threadIdx.x == 0 && rg < total_row_groups) {
+      uint32_t total_bytes = num_tiles_k * tile_bytes;
+      mbarrier_expect_tx(&mb[0], total_bytes);
+      for (int kt = 0; kt < num_tiles_k; kt++) {
+        cp_async_bulk_tensor_2d(
+            &mb[0], &tma_B,
+            s_B + kt * COMPUTE_WARPS * TILE_K,
+            static_cast<int32_t>(kt * TILE_K),
+            static_cast<int32_t>(row_base));
       }
-
-      // Compute consumers: dot product with cur_buf
-      if (!is_dma && my_row < N) {
-        const __nv_bfloat16* B_row = s_B_buf[cur_buf] + comp_idx * TILE_K;
-        int k_start = k_tile * TILE_K;
-
-#pragma unroll 4
-        for (int k = lane_id; k < TILE_K; k += WARP_SIZE) {
-          acc += __bfloat162float(s_A[k_start + k]) * __bfloat162float(B_row[k]);
-        }
-
-        if (k_tile == num_tiles_k - 1) {
-          acc = warp_reduce_sum(acc);
-          if (lane_id == 0) {
-            C[my_row] = __float2bfloat16(acc);
-          }
-          acc = 0.0f;
-        }
-      }
-
-      // DMA producer: fire-and-forget TMA into nxt_buf
-      if (threadIdx.x == 0) {
-        int next_k_tile = k_tile + 1;
-        int next_rg = rg;
-
-        if (next_k_tile >= num_tiles_k) {
-          next_k_tile = 0;
-          next_rg = rg + num_blocks;
-        }
-
-        int next_row_base = next_rg * COMPUTE_WARPS;
-
-        if (next_rg < total_row_groups) {
-          uint32_t tile_bytes = COMPUTE_WARPS * TILE_K * sizeof(__nv_bfloat16);
-          mbarrier_expect_tx(&mb[nxt_buf], tile_bytes);
-          cp_async_bulk_tensor_2d(
-              &mb[nxt_buf], &tma_B, s_B_buf[nxt_buf],
-              static_cast<int32_t>(next_k_tile * TILE_K),
-              static_cast<int32_t>(next_row_base));
-        }
-      }
-
-      __syncthreads();
     }
+
+    // Compute: wait for TMA data
+    if (!is_dma) {
+      mbarrier_wait(&mb[0], phase);
+      phase ^= 1;
+    }
+
+    // Compute: full dot product
+    if (!is_dma && my_row < N) {
+      float acc = 0.0f;
+#pragma unroll
+      for (int kt = 0; kt < (K / TILE_K); kt++) {
+        const __nv_bfloat16* B_row_tile =
+            s_B + kt * COMPUTE_WARPS * TILE_K + comp_idx * TILE_K;
+        int k_start = kt * TILE_K;
+#pragma unroll
+        for (int i = 0; i < PAIRS; i++) {
+          int idx = lane_id * 2 + i * WARP_SIZE * 2;
+          __nv_bfloat162 b_val = *reinterpret_cast<const __nv_bfloat162*>(&B_row_tile[idx]);
+          __nv_bfloat162 a_val = *reinterpret_cast<const __nv_bfloat162*>(&s_A[k_start + idx]);
+          float2 av = __bfloat1622float2(a_val);
+          float2 bv = __bfloat1622float2(b_val);
+          acc += av.x * bv.x + av.y * bv.y;
+        }
+      }
+      acc = warp_reduce_sum(acc);
+      if (lane_id == 0) {
+        C[my_row] = __float2bfloat16(acc);
+      }
+    }
+
+    __syncthreads();
   }
 }
 
@@ -281,9 +253,9 @@ void gemv_ws_cu(
   // ---- Shared memory sizing ----
   size_t s_A_bytes = (size_t)K * sizeof(__nv_bfloat16);
   size_t s_A_aligned = (s_A_bytes + 127) & ~(size_t)127;
-  size_t s_B_bytes = NUM_STAGES * COMPUTE_WARPS * TILE_K * sizeof(__nv_bfloat16);
+  size_t s_B_bytes = COMPUTE_WARPS * K * sizeof(__nv_bfloat16);
   size_t mb_offset = (s_A_aligned + s_B_bytes + 7) & ~(size_t)7;
-  size_t smem_size = mb_offset + NUM_STAGES * sizeof(mbarrier_t);
+  size_t smem_size = mb_offset + sizeof(mbarrier_t);
 
   cudaFuncSetAttribute(
       gemv_ws_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
