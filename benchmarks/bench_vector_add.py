@@ -1,3 +1,4 @@
+import argparse
 import subprocess
 import sys
 from pathlib import Path
@@ -78,7 +79,7 @@ def _compute_sol(roofline, profile, input_bytes):
     }
 
 
-def _run_workload(n, label, profile):
+def _run_workload(n, label, profile, backends):
     """Run all backends for a single workload and print two tables."""
     print(f"\n{'=' * 60}")
     print(f"  VectorAdd workload: {label}  (n={n})")
@@ -99,7 +100,7 @@ def _run_workload(n, label, profile):
     sol = _compute_sol(roofline, profile, A.nbytes + B.nbytes) if profile else None
 
     rows = []
-    for backend in BACKENDS:
+    for backend in backends:
         try:
             op = VectorAddOp(n=n, backend=backend)
             _, _, C = op.gen_data()
@@ -143,12 +144,38 @@ def _run_workload(n, label, profile):
         print(tabulate(sol_rows, headers=["SOL metric", "value"], tablefmt="github"))
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(add_help=False, description="VectorAdd kernel benchmark")
+    parser.add_argument("-h", action="store_true", dest="list_backends",
+                        help="List available backends and exit")
+    parser.add_argument("-k", "--backends", type=str, default=None,
+                        help="Comma-separated list of backends to benchmark (ref is always included)")
+    return parser.parse_args()
+
+
 def main():
+    args = _parse_args()
+
+    if args.list_backends:
+        print("Available backends:", ", ".join(BACKENDS))
+        return
+
+    if args.backends is not None:
+        selected = [b.strip() for b in args.backends.split(",")]
+        invalid = [b for b in selected if b != "ref" and b not in BACKENDS]
+        if invalid:
+            print(f"Unknown backends: {', '.join(invalid)}")
+            print(f"Available: {', '.join(BACKENDS)}")
+            return
+        backends = [b for b in selected if b in BACKENDS]
+    else:
+        backends = BACKENDS
+
     profile_name = _detect_gpu_profile()
     profile = _load_profile(profile_name) if profile_name else None
 
     for n, label in WORKLOADS:
-        _run_workload(n, label, profile)
+        _run_workload(n, label, profile, backends)
 
 
 if __name__ == "__main__":
