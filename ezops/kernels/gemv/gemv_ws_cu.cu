@@ -93,15 +93,17 @@ __device__ __forceinline__ void cp_async_bulk_tensor_2d(
 }
 
 // ---------------------------------------------------------------------------
-// Persistent warp-specialized GEMV kernel (TMA version)
+// Persistent warp-specialized GEMV kernel (TMA + mbarrier_wait)
 //   C[N] = A[K] @ B[N,K]
 //
 // Warp 0: DMA producer (loads A via cp.async.cg, B via TMA)
 // Warps 1-8: Compute consumers (each warp handles one row)
 //
-// TMA descriptor for B is passed as __grid_constant__ (parameter memory).
-// mbarrier used only by DMA warp to wait for TMA completion.
-// __syncthreads() for DMA-compute sync (same pattern as cp.async.cg version).
+// Sync model:
+//   - Compute warps call mbarrier_wait(mb[cur_buf]) to wait for TMA data.
+//   - DMA thread fires TMA (expect_tx + issue) without waiting for completion.
+//   - __syncthreads() at the bottom prevents DMA from getting too far ahead.
+//   - Overlap: TMA for nxt_buf runs in background while compute works on cur_buf.
 // ---------------------------------------------------------------------------
 __global__ void __launch_bounds__(288, 1)
 gemv_ws_kernel(
@@ -119,19 +121,16 @@ gemv_ws_kernel(
   // ---- Shared memory layout ----
   extern __shared__ char smem_raw[];
 
-  // s_A: K bf16 elements
   __nv_bfloat16* s_A = reinterpret_cast<__nv_bfloat16*>(smem_raw);
   size_t s_A_bytes = (size_t)K * sizeof(__nv_bfloat16);
   size_t s_A_aligned = (s_A_bytes + 127) & ~(size_t)127;
 
-  // s_B: 2 stages x COMPUTE_WARPS rows x TILE_K cols
   __nv_bfloat16* s_B_base = reinterpret_cast<__nv_bfloat16*>(smem_raw + s_A_aligned);
   __nv_bfloat16* s_B_buf[NUM_STAGES] = {
       s_B_base,
       s_B_base + COMPUTE_WARPS * TILE_K,
   };
 
-  // mbarriers: 8-byte aligned, after B buffers
   size_t s_B_bytes = NUM_STAGES * COMPUTE_WARPS * TILE_K * sizeof(__nv_bfloat16);
   size_t mb_offset = (s_A_aligned + s_B_bytes + 7) & ~(size_t)7;
   mbarrier_t* mb = reinterpret_cast<mbarrier_t*>(smem_raw + mb_offset);
@@ -160,19 +159,18 @@ gemv_ws_kernel(
   }
   __syncthreads();
 
-  // ---- Prologue: TMA load first B tile for first row group ----
+  // ---- Prologue: TMA load first B tile (fire and forget) ----
   if (threadIdx.x == 0 && num_tiles_k > 0 && blockIdx.x < total_row_groups) {
     int row_base = blockIdx.x * COMPUTE_WARPS;
     uint32_t tile_bytes = COMPUTE_WARPS * TILE_K * sizeof(__nv_bfloat16);
     mbarrier_expect_tx(&mb[0], tile_bytes);
-    cp_async_bulk_tensor_2d(&mb[0], &tma_B, s_B_buf[0], /*coord_fast=*/0, /*coord_slow=*/row_base);
-    mbarrier_wait(&mb[0], 0);
+    cp_async_bulk_tensor_2d(
+        &mb[0], &tma_B, s_B_buf[0],
+        /*coord_fast=*/0, /*coord_slow=*/row_base);
   }
-  __syncthreads();
 
   // ---- Phase 2: Persistent pipeline ----
-  // mb[0] phase flipped after prologue wait; mb[1] untouched (phase 0)
-  uint32_t mb_phase[2] = {1, 0};
+  uint32_t compute_phase[2] = {0, 0};
 
   for (int rg = blockIdx.x; rg < total_row_groups; rg += num_blocks) {
     int row_base = rg * COMPUTE_WARPS;
@@ -182,6 +180,12 @@ gemv_ws_kernel(
     for (int k_tile = 0; k_tile < num_tiles_k; k_tile++) {
       int cur_buf = k_tile & 1;
       int nxt_buf = cur_buf ^ 1;
+
+      // Compute warps: wait for TMA data in cur_buf
+      if (!is_dma) {
+        mbarrier_wait(&mb[cur_buf], compute_phase[cur_buf]);
+        compute_phase[cur_buf] ^= 1;
+      }
 
       // Compute consumers: dot product with cur_buf
       if (!is_dma && my_row < N) {
@@ -202,7 +206,7 @@ gemv_ws_kernel(
         }
       }
 
-      // DMA producer: TMA load next tile into nxt_buf (single thread only)
+      // DMA producer: fire-and-forget TMA into nxt_buf
       if (threadIdx.x == 0) {
         int next_k_tile = k_tile + 1;
         int next_rg = rg;
@@ -221,8 +225,6 @@ gemv_ws_kernel(
               &mb[nxt_buf], &tma_B, s_B_buf[nxt_buf],
               static_cast<int32_t>(next_k_tile * TILE_K),
               static_cast<int32_t>(next_row_base));
-          mbarrier_wait(&mb[nxt_buf], mb_phase[nxt_buf]);
-          mb_phase[nxt_buf] ^= 1;
         }
       }
 
@@ -251,7 +253,6 @@ void gemv_ws_cu(
   int num_sms = prop.multiProcessorCount;
 
   // ---- Create TMA descriptor for B[N, K] ----
-  // TMA 2D: fast_dim=K, slow_dim=N, box=[TILE_K, COMPUTE_WARPS]
   CUtensorMap tma_B;
   uint64_t globalDim[2] = {(uint64_t)K, (uint64_t)N};
   uint64_t globalStrides[1] = {(uint64_t)(K * sizeof(__nv_bfloat16))};
