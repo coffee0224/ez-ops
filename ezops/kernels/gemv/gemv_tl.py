@@ -478,27 +478,49 @@ class PersistantGemvTilelangKernel(BaseKernel):
         self.K = K
         self.num_sms = get_num_sms()
         self._kernel = self._make_kernel()
-        self._compiled = None
+        self._best_kernel = None
 
     def _make_kernel(self):
         N = self.N
         K = self.K
         num_sms = self.num_sms
-        BLOCK_N = 8
-        BLOCK_K = 256
 
+        def get_configs():
+            return [
+                {
+                    "BLOCK_N": 8,
+                    "BLOCK_K": 256,
+                    "reduce_threads": 32,
+                },
+                {
+                    "BLOCK_N": 16,
+                    "BLOCK_K": 256,
+                    "reduce_threads": 32,
+                },
+            ]
+
+        @autotune(
+            configs=get_configs(),
+            warmup=3,
+            rep=20,
+        )
         @tilelang.jit(
             out_idx=None,
-            pass_configs={
-                PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-                PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-            },
+            target="auto",
         )
         def kernel(
-            dtype: str = "bfloat16",
-            accum_dtype: str = "float",
+            BLOCK_N: int = None,
+            BLOCK_K: int = None,
+            reduce_threads: int = None,
         ):
-            reduce_threads = 32
+            dtype = "bfloat16"
+            accum_dtype = "float"
+
+            if BLOCK_N is None or BLOCK_K is None or reduce_threads is None:
+                BLOCK_N = 8
+                BLOCK_K = 256
+                reduce_threads = 32
+
             TILE_K = BLOCK_K // reduce_threads
             total_row_groups = T.ceildiv(N, BLOCK_N)
             num_iters = T.ceildiv(total_row_groups, num_sms)
@@ -561,6 +583,8 @@ class PersistantGemvTilelangKernel(BaseKernel):
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
         assert A.is_cuda and B.is_cuda and C.is_cuda
-        if self._compiled is None:
-            self._compiled = self._kernel()
-        self._compiled(A, B, C)
+        if self._best_kernel is None:
+            # .compile() triggers autotune and returns the compiled JITKernel,
+            # bypassing the autotuner's broken eager-mode execution path.
+            self._best_kernel = self._kernel()
+        self._best_kernel(A, B, C)
