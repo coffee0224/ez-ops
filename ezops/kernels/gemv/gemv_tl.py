@@ -23,7 +23,7 @@ class NaiveGemvTileLangKernel(BaseKernel):
         self._kernel = self._make_kernel()
 
     def _make_kernel(self):
-        @tilelang.jit(out_idx=[2])
+        @tilelang.jit(out_idx=None)
         def kernel(
             N: int,
             K: int,
@@ -58,8 +58,7 @@ class NaiveGemvTileLangKernel(BaseKernel):
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
         assert A.is_cuda and B.is_cuda and C.is_cuda
-        out = self._kernel(N=self.N, K=self.K, BLOCK_N=128, BLOCK_K=128)(A, B)
-        C.copy_(out)
+        self._kernel(N=self.N, K=self.K, BLOCK_N=128, BLOCK_K=128)(A, B, C)
 
 
 @register_kernel("gemv", "naive_splitk_gemv_tilelang")
@@ -70,7 +69,7 @@ class NaiveSplitkGemvTileLangKernel(BaseKernel):
         self._kernel = self._make_kernel()
 
     def _make_kernel(self):
-        @tilelang.jit(out_idx=[2])
+        @tilelang.jit(out_idx=None)
         def kernel(
             N: int,
             K: int,
@@ -108,8 +107,7 @@ class NaiveSplitkGemvTileLangKernel(BaseKernel):
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
         assert A.is_cuda and B.is_cuda and C.is_cuda
-        out = self._kernel(N=self.N, K=self.K, BLOCK_N=32, BLOCK_K=32)(A, B)
-        C.copy_(out)
+        self._kernel(N=self.N, K=self.K, BLOCK_N=32, BLOCK_K=32)(A, B, C)
 
 
 @register_kernel("gemv", "splitk_gemv_tilelang")
@@ -120,7 +118,7 @@ class SplitkGemvTileLangKernel(BaseKernel):
         self._kernel = self._make_kernel()
 
     def _make_kernel(self):
-        @tilelang.jit(out_idx=[2])
+        @tilelang.jit(out_idx=None)
         def kernel(
             N: int,
             K: int,
@@ -163,8 +161,7 @@ class SplitkGemvTileLangKernel(BaseKernel):
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
         assert A.is_cuda and B.is_cuda and C.is_cuda
-        out = self._kernel(N=self.N, K=self.K, reduce_threads=32, BLOCK_N=32, BLOCK_K=32)(A, B)
-        C.copy_(out)
+        self._kernel(N=self.N, K=self.K, reduce_threads=32, BLOCK_N=32, BLOCK_K=32)(A, B, C)
 
 
 @register_kernel("gemv", "splitk_gemv_vectorized_tilelang")
@@ -175,7 +172,7 @@ class SplitkGemvVectorizedTileLangKernel(BaseKernel):
         self._kernel = self._make_kernel()
 
     def _make_kernel(self):
-        @tilelang.jit(out_idx=[2])
+        @tilelang.jit(out_idx=None)
         def kernel(
             N: int,
             K: int,
@@ -219,8 +216,7 @@ class SplitkGemvVectorizedTileLangKernel(BaseKernel):
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
         assert A.is_cuda and B.is_cuda and C.is_cuda
-        out = self._kernel(N=self.N, K=self.K, reduce_threads=32, BLOCK_N=2)(A, B)
-        C.copy_(out)
+        self._kernel(N=self.N, K=self.K, reduce_threads=32, BLOCK_N=2)(A, B, C)
 
 
 @register_kernel("gemv", "splitk_gemv_vectorized_tvm_tilelang")
@@ -231,7 +227,7 @@ class SplitkGemvVectorizedTvmTileLangKernel(BaseKernel):
         self._kernel = self._make_kernel()
 
     def _make_kernel(self):
-        @tilelang.jit(out_idx=[2])
+        @tilelang.jit(out_idx=None)
         def kernel(
             N: int,
             K: int,
@@ -289,8 +285,7 @@ class SplitkGemvVectorizedTvmTileLangKernel(BaseKernel):
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
         assert A.is_cuda and B.is_cuda and C.is_cuda
-        out = self._kernel(N=self.N, K=self.K, reduce_threads=32, BLOCK_N=2)(A, B)
-        C.copy_(out)
+        self._kernel(N=self.N, K=self.K, reduce_threads=32, BLOCK_N=2)(A, B, C)
 
 
 @register_kernel("gemv", "autotune_tilelang")
@@ -329,7 +324,7 @@ class AutotuneGemvTileLangKernel(BaseKernel):
             rep=20,
         )
         @tilelang.jit(
-            out_idx=[2],
+            out_idx=None,
             target="auto",
         )
         def kernel(
@@ -392,8 +387,7 @@ class AutotuneGemvTileLangKernel(BaseKernel):
         assert A.is_cuda and B.is_cuda and C.is_cuda
         if self._best_kernel is None:
             self._best_kernel = self._kernel()
-        out = self._best_kernel(A, B)
-        C.copy_(out)
+        self._best_kernel(A, B, C)
 
 
 @register_kernel("gemv", "alloc_reducer_gemv_tilelang")
@@ -430,12 +424,13 @@ class AllocReducerGemvTileLangKernel(BaseKernel):
             rep=20,
         )
         @tilelang.jit(
+            out_idx=None,
             pass_configs={
                 tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
                 tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
             },
         )
-        def kernel(A: T.Tensor, B: T.Tensor, block_M=None, block_N=None, num_stages=None, threads=None):
+        def kernel(A: T.Tensor, B: T.Tensor, C: T.Tensor, block_M=None, block_N=None, num_stages=None, threads=None):
             dtype = "bfloat16"
             accum_dtype = "float"
             if block_M is None or block_N is None or num_stages is None or threads is None:
@@ -446,7 +441,7 @@ class AllocReducerGemvTileLangKernel(BaseKernel):
 
             A: T.Tensor((K,), dtype)
             B: T.Tensor((N, K), dtype)
-            C = T.empty((N,), dtype)
+            C: T.Tensor((N,), dtype)
 
             with T.Kernel(T.ceildiv(N, block_M), threads=threads) as i0_m:
                 o_reducer = T.alloc_reducer(block_M, accum_dtype, replication="all")
@@ -463,8 +458,6 @@ class AllocReducerGemvTileLangKernel(BaseKernel):
                 T.finalize_reducer(o_reducer)
                 T.copy(o_reducer, C[i0_m * block_M])
 
-            return C
-
         return kernel
 
     def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
@@ -472,9 +465,8 @@ class AllocReducerGemvTileLangKernel(BaseKernel):
         if self._best_kernel is None:
             # .compile() triggers autotune and returns the compiled JITKernel,
             # bypassing the autotuner's broken eager-mode execution path.
-            self._best_kernel = self._kernel.compile(A, B)
-        out = self._best_kernel(A, B)
-        C.copy_(out)
+            self._best_kernel = self._kernel.compile(A, B, C)
+        self._best_kernel(A, B, C)
 
 
 @register_kernel("gemv", "ps_gemv_tilelang")
