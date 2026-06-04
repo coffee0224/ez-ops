@@ -20,6 +20,10 @@ Usage:
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("TILELANG_CACHE_DIR", os.path.join(os.getcwd(), ".tilelang"))
+
 import argparse
 import importlib
 import shutil

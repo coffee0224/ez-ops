@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("TILELANG_CACHE_DIR", os.path.join(os.getcwd(), ".tilelang"))
+
 import argparse
 import subprocess
 import sys
@@ -23,9 +27,9 @@ N_TRIALS = 3
 WORKLOADS = [
     # (N, K, label)
     (4096, 1024, "qwen3-0.6B-qkv-proj"),
-    (1024, 2048, "qwen3-0.6B-o-proj"),
-    (3072, 1024, "qwen3-0.6B-up-proj"),
-    (1024, 3072, "qwen3-0.6B-down-proj"),
+    # (1024, 2048, "qwen3-0.6B-o-proj"),
+    # (3072, 1024, "qwen3-0.6B-up-proj"),
+    # (1024, 3072, "qwen3-0.6B-down-proj"),
 ]
 
 
@@ -171,10 +175,14 @@ def _run_workload(n, k, label, profile, backends):
 
 def _parse_args():
     parser = argparse.ArgumentParser(add_help=False, description="GEMV kernel benchmark")
-    parser.add_argument("-h", action="store_true", dest="list_backends",
-                        help="List available backends and exit")
-    parser.add_argument("-k", "--backends", type=str, default=None,
-                        help="Comma-separated list of backends to benchmark (ref is always included)")
+    parser.add_argument("-h", action="store_true", dest="list_backends", help="List available backends and exit")
+    parser.add_argument(
+        "-k",
+        "--backends",
+        type=str,
+        default=None,
+        help="Comma-separated list of backends to benchmark (ref is always included)",
+    )
     return parser.parse_args()
 
 
