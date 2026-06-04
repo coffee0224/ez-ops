@@ -1,3 +1,7 @@
+import os
+
+os.environ.setdefault("TILELANG_CACHE_DIR", os.path.join(os.getcwd(), ".tilelang"))
+
 import argparse
 import subprocess
 import sys
@@ -22,11 +26,11 @@ N_TRIALS = 3
 
 WORKLOADS = [
     # (batch, num_heads, seq_len, head_dim, label)
-    (1, 32, 1024, 128, "llama-7b-s1k"),
-    (1, 32, 4096, 128, "llama-7b-s4k"),
-    (1, 32, 8192, 128, "llama-7b-s8k"),
-    (1, 32, 16384, 128, "llama-7b-s16k"),
-    (1, 32, 32768, 128, "llama-7b-s16k"),
+    (1, 16, 1024, 128, "qwen3-0.6b-s1k"),
+    (1, 16, 4096, 128, "qwen3-0.6b-s4k"),
+    (1, 16, 8192, 128, "qwen3-0.6b-s8k"),
+    (1, 16, 16384, 128, "qwen3-0.6b-s16k"),
+    (1, 16, 32768, 128, "qwen3-0.6b-s16k"),
 ]
 
 
@@ -164,10 +168,14 @@ def _run_workload(batch, num_heads, seq_len, head_dim, label, profile, backends)
 
 def _parse_args():
     parser = argparse.ArgumentParser(add_help=False, description="AttnDecode kernel benchmark")
-    parser.add_argument("-h", action="store_true", dest="list_backends",
-                        help="List available backends and exit")
-    parser.add_argument("-k", "--backends", type=str, default=None,
-                        help="Comma-separated list of backends to benchmark (ref is always included)")
+    parser.add_argument("-h", action="store_true", dest="list_backends", help="List available backends and exit")
+    parser.add_argument(
+        "-k",
+        "--backends",
+        type=str,
+        default=None,
+        help="Comma-separated list of backends to benchmark (ref is always included)",
+    )
     return parser.parse_args()
 
 
