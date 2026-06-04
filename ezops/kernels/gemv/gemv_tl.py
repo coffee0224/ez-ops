@@ -497,6 +497,16 @@ class PersistantGemvTilelangKernel(BaseKernel):
                     "BLOCK_K": 256,
                     "reduce_threads": 32,
                 },
+                {
+                    "BLOCK_N": 16,
+                    "BLOCK_K": 128,
+                    "reduce_threads": 32,
+                },
+                {
+                    "BLOCK_N": 8,
+                    "BLOCK_K": 128,
+                    "reduce_threads": 32,
+                },
             ]
 
         @autotune(
