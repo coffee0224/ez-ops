@@ -1,5 +1,8 @@
+import os
+
+os.environ.setdefault("TILELANG_CACHE_DIR", os.path.join(os.getcwd(), ".tilelang"))
+
 import logging
-import math
 
 import tilelang
 import torch
@@ -11,9 +14,6 @@ logging.getLogger("tilelang.cache.kernel_cache").setLevel(logging.ERROR)
 
 from ..base_kernel import BaseKernel
 from ...registry import register_kernel
-
-# head_dim=128 -> 4 bfloat16 elements per lane (128 bits / 32 lanes)
-VEC = 4
 
 
 @register_kernel("attn_decode", "flash_decode_tilelang")
@@ -61,20 +61,23 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                     lane_id = T.get_thread_binding(0)
                     warp_id = T.get_thread_binding(1)
 
-                    Q_shared = T.alloc_shared((head_dim,), dtype)
+                    # float32 shared memory: each 4-byte element maps to a unique bank,
+                    # eliminating 2-way bank conflicts from bfloat16 (2-byte) packing.
+                    # 128 x float32 = 512 bytes shared memory — negligible.
+                    Q_shared = T.alloc_shared((head_dim,), accum_dtype)
 
                     for it in T.serial(num_iters):
                         task_id = it * num_sms + block_id
                         if task_id < total_tasks:
-                            # Load Q cooperatively
+                            # Load Q cooperatively: 128 threads, 4 coalesced warp loads
                             for d in T.Parallel(head_dim):
-                                Q_shared[d] = Q[task_id, d]
+                                Q_shared[d] = Q[task_id, d].astype(accum_dtype)
 
-                            # Load Q into registers (4 elements per lane)
-                            q0 = Q_shared[lane_id * VEC + 0].astype(accum_dtype)
-                            q1 = Q_shared[lane_id * VEC + 1].astype(accum_dtype)
-                            q2 = Q_shared[lane_id * VEC + 2].astype(accum_dtype)
-                            q3 = Q_shared[lane_id * VEC + 3].astype(accum_dtype)
+                            # Load Q into registers with contiguous indexing (no bank conflicts)
+                            q0 = Q_shared[0 * 32 + lane_id]
+                            q1 = Q_shared[1 * 32 + lane_id]
+                            q2 = Q_shared[2 * 32 + lane_id]
+                            q3 = Q_shared[3 * 32 + lane_id]
 
                             # Per-warp accumulators
                             o0 = T.alloc_local((1,), accum_dtype)
@@ -94,17 +97,19 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                             for pw in T.serial(T.ceildiv(seq_len, num_warps)):
                                 pos = pw * num_warps + warp_id
                                 if pos < seq_len:
+                                    # Coalesced K loads: 4 contiguous 32-element warp loads
+                                    # instead of 4 strided (lane_id*4+j) loads hitting 2 segments each
                                     k0 = K[
-                                        task_id, pos, lane_id * VEC + 0
+                                        task_id, pos, 0 * 32 + lane_id
                                     ].astype(accum_dtype)
                                     k1 = K[
-                                        task_id, pos, lane_id * VEC + 1
+                                        task_id, pos, 1 * 32 + lane_id
                                     ].astype(accum_dtype)
                                     k2 = K[
-                                        task_id, pos, lane_id * VEC + 2
+                                        task_id, pos, 2 * 32 + lane_id
                                     ].astype(accum_dtype)
                                     k3 = K[
-                                        task_id, pos, lane_id * VEC + 3
+                                        task_id, pos, 3 * 32 + lane_id
                                     ].astype(accum_dtype)
 
                                     sp = T.alloc_local((1,), accum_dtype)
@@ -135,17 +140,18 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                     wt = T.exp2((sc[0] - ms[0]) * log2e)
                                     ls[0] = ls[0] * ed + wt
 
+                                    # Coalesced V loads: same contiguous pattern
                                     v0 = V[
-                                        task_id, pos, lane_id * VEC + 0
+                                        task_id, pos, 0 * 32 + lane_id
                                     ].astype(accum_dtype)
                                     v1 = V[
-                                        task_id, pos, lane_id * VEC + 1
+                                        task_id, pos, 1 * 32 + lane_id
                                     ].astype(accum_dtype)
                                     v2 = V[
-                                        task_id, pos, lane_id * VEC + 2
+                                        task_id, pos, 2 * 32 + lane_id
                                     ].astype(accum_dtype)
                                     v3 = V[
-                                        task_id, pos, lane_id * VEC + 3
+                                        task_id, pos, 3 * 32 + lane_id
                                     ].astype(accum_dtype)
 
                                     o0[0] = o0[0] * ed + wt * v0
@@ -268,11 +274,11 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                     )
                                 )
 
-                            # Normalize and write output
-                            Out[task_id, lane_id * VEC + 0] = (bo0[0] / bs[0]).astype(dtype)
-                            Out[task_id, lane_id * VEC + 1] = (bo1[0] / bs[0]).astype(dtype)
-                            Out[task_id, lane_id * VEC + 2] = (bo2[0] / bs[0]).astype(dtype)
-                            Out[task_id, lane_id * VEC + 3] = (bo3[0] / bs[0]).astype(dtype)
+                            # Normalize and write output with contiguous indexing
+                            Out[task_id, 0 * 32 + lane_id] = (bo0[0] / bs[0]).astype(dtype)
+                            Out[task_id, 1 * 32 + lane_id] = (bo1[0] / bs[0]).astype(dtype)
+                            Out[task_id, 2 * 32 + lane_id] = (bo2[0] / bs[0]).astype(dtype)
+                            Out[task_id, 3 * 32 + lane_id] = (bo3[0] / bs[0]).astype(dtype)
 
             return main
 
