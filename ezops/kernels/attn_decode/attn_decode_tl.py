@@ -1,5 +1,5 @@
 import logging
-import itertools
+import math
 
 import tilelang
 import torch
@@ -12,7 +12,7 @@ logging.getLogger("tilelang.cache.kernel_cache").setLevel(logging.ERROR)
 from ..base_kernel import BaseKernel
 from ...registry import register_kernel
 
-# head_dim=128 → 4 bfloat16 elements per lane (128 bits / 32 lanes)
+# head_dim=128 -> 4 bfloat16 elements per lane (128 bits / 32 lanes)
 VEC = 4
 
 
@@ -35,10 +35,9 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
         num_sms = self.num_sms
 
         def get_configs():
-            num_warps = [1, 2, 4, 8]
-            return [{"num_warps": nw} for nw in num_warps]
+            return [{"num_warps": nw} for nw in [2, 4, 8, 16]]
 
-        @autotune(configs=get_configs(), warmup=3, rep=20)
+        @autotune(configs=get_configs(), warmup=5, rep=50)
         @tilelang.jit(out_idx=[3], target="auto")
         def kernel(num_warps=None):
             dtype = "bfloat16"
@@ -58,7 +57,6 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                 V: T.Buffer((total_tasks, seq_len, head_dim), dtype),
                 Out: T.Buffer((total_tasks, head_dim), dtype),
             ):
-                # threads=(32, num_warps): lane_id=dim0, warp_id=dim1
                 with T.Kernel(num_sms, threads=(32, num_warps)) as block_id:
                     lane_id = T.get_thread_binding(0)
                     warp_id = T.get_thread_binding(1)
@@ -96,33 +94,22 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                             for pw in T.serial(T.ceildiv(seq_len, num_warps)):
                                 pos = pw * num_warps + warp_id
                                 if pos < seq_len:
-                                    # Load K
                                     k0 = K[
-                                        task_id,
-                                        pos,
-                                        lane_id * VEC + 0,
+                                        task_id, pos, lane_id * VEC + 0
                                     ].astype(accum_dtype)
                                     k1 = K[
-                                        task_id,
-                                        pos,
-                                        lane_id * VEC + 1,
+                                        task_id, pos, lane_id * VEC + 1
                                     ].astype(accum_dtype)
                                     k2 = K[
-                                        task_id,
-                                        pos,
-                                        lane_id * VEC + 2,
+                                        task_id, pos, lane_id * VEC + 2
                                     ].astype(accum_dtype)
                                     k3 = K[
-                                        task_id,
-                                        pos,
-                                        lane_id * VEC + 3,
+                                        task_id, pos, lane_id * VEC + 3
                                     ].astype(accum_dtype)
 
-                                    # Partial QK dot product
                                     sp = T.alloc_local((1,), accum_dtype)
                                     sp[0] = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3
 
-                                    # Warp reduce sum
                                     sc = T.alloc_local((1,), accum_dtype)
                                     with T.attr(
                                         sum_red,
@@ -141,7 +128,6 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                         )
                                     sc[0] *= attn_scale
 
-                                    # Online softmax update
                                     om = T.alloc_local((1,), accum_dtype)
                                     om[0] = ms[0]
                                     ms[0] = T.max(ms[0], sc[0])
@@ -149,26 +135,17 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                     wt = T.exp2((sc[0] - ms[0]) * log2e)
                                     ls[0] = ls[0] * ed + wt
 
-                                    # Load V
                                     v0 = V[
-                                        task_id,
-                                        pos,
-                                        lane_id * VEC + 0,
+                                        task_id, pos, lane_id * VEC + 0
                                     ].astype(accum_dtype)
                                     v1 = V[
-                                        task_id,
-                                        pos,
-                                        lane_id * VEC + 1,
+                                        task_id, pos, lane_id * VEC + 1
                                     ].astype(accum_dtype)
                                     v2 = V[
-                                        task_id,
-                                        pos,
-                                        lane_id * VEC + 2,
+                                        task_id, pos, lane_id * VEC + 2
                                     ].astype(accum_dtype)
                                     v3 = V[
-                                        task_id,
-                                        pos,
-                                        lane_id * VEC + 3,
+                                        task_id, pos, lane_id * VEC + 3
                                     ].astype(accum_dtype)
 
                                     o0[0] = o0[0] * ed + wt * v0
@@ -177,7 +154,6 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                     o3[0] = o3[0] * ed + wt * v3
 
                             # --- Cross-warp reduction ---
-                            # Block max of per-warp max scores
                             bm = T.alloc_local((1,), accum_dtype)
                             with T.attr(
                                 max_red,
@@ -195,10 +171,8 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                     )
                                 )
 
-                            # Correction factor
                             ws = T.exp2((ms[0] - bm[0]) * log2e)
 
-                            # Corrected sum
                             cs = T.alloc_local((1,), accum_dtype)
                             cs[0] = ls[0] * ws
                             bs = T.alloc_local((1,), accum_dtype)
@@ -218,7 +192,6 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                     )
                                 )
 
-                            # Corrected outputs (unrolled per element)
                             c0 = T.alloc_local((1,), accum_dtype)
                             c0[0] = o0[0] * ws
                             bo0 = T.alloc_local((1,), accum_dtype)
