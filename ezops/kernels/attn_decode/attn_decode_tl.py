@@ -24,21 +24,48 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
         self.seq_len = seq_len
         self.head_dim = head_dim
         self.num_sms = get_num_sms()
-        self._kernel = self._make_kernel()
-        self._best_kernel = None
+        self.num_split = self._pick_num_split()
+        self._split_kernel = self._make_split_kernel()
+        self._combine_kernel = self._make_combine_kernel()
+        self._best_split = None
+        self._combine_built = None
 
-    def _make_kernel(self):
+    def _pick_num_split(self):
+        """Pick num_split so that batch*num_heads*num_split fills all SMs with even balance.
+
+        For (1,16) on 36 SMs: smallest k where 16*k is a multiple of 36 is k=9 (144 units, 4/SM).
+        """
         total_tasks = self.batch * self.num_heads
-        num_iters = (total_tasks + self.num_sms - 1) // self.num_sms
+        if total_tasks <= 0:
+            return 1
+        min_split = (self.num_sms + total_tasks - 1) // total_tasks
+        # require divisibility for both balance and seq_len chunking
+        for cand in range(min_split, min_split + self.num_sms):
+            if (
+                self.seq_len % cand == 0
+                and (total_tasks * cand) % self.num_sms == 0
+            ):
+                return cand
+        for cand in range(min_split, min_split + self.num_sms):
+            if self.seq_len % cand == 0:
+                return cand
+        return min_split
+
+    def _make_split_kernel(self):
+        total_tasks = self.batch * self.num_heads
+        num_split = self.num_split
+        total_work_units = total_tasks * num_split
+        num_iters = (total_work_units + self.num_sms - 1) // self.num_sms
         seq_len = self.seq_len
         head_dim = self.head_dim
         num_sms = self.num_sms
+        kv_chunk = seq_len // num_split
 
         def get_configs():
             return [{"num_warps": nw} for nw in [2, 4, 8, 16]]
 
         @autotune(configs=get_configs(), warmup=5, rep=50)
-        @tilelang.jit(out_idx=[3], target="auto")
+        @tilelang.jit(target="auto")
         def kernel(num_warps=None):
             dtype = "bfloat16"
             accum_dtype = "float"
@@ -55,31 +82,30 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                 Q: T.Buffer((total_tasks, head_dim), dtype),
                 K: T.Buffer((total_tasks, seq_len, head_dim), dtype),
                 V: T.Buffer((total_tasks, seq_len, head_dim), dtype),
-                Out: T.Buffer((total_tasks, head_dim), dtype),
+                Out_partial: T.Buffer((total_tasks, num_split, head_dim), dtype),
+                LSE_partial: T.Buffer((total_tasks, num_split), accum_dtype),
             ):
                 with T.Kernel(num_sms, threads=(32, num_warps)) as block_id:
                     lane_id = T.get_thread_binding(0)
                     warp_id = T.get_thread_binding(1)
 
-                    # float32 shared memory: each 4-byte element maps to a unique bank,
-                    # eliminating 2-way bank conflicts from bfloat16 (2-byte) packing.
-                    # 128 x float32 = 512 bytes shared memory — negligible.
                     Q_shared = T.alloc_shared((head_dim,), accum_dtype)
 
                     for it in T.serial(num_iters):
-                        task_id = it * num_sms + block_id
-                        if task_id < total_tasks:
-                            # Load Q cooperatively: 128 threads, 4 coalesced warp loads
+                        work_id = it * num_sms + block_id
+                        if work_id < total_work_units:
+                            split_id = work_id % num_split
+                            task_id = work_id // num_split
+                            kv_start = split_id * kv_chunk
+
                             for d in T.Parallel(head_dim):
                                 Q_shared[d] = Q[task_id, d].astype(accum_dtype)
 
-                            # Load Q into registers with contiguous indexing (no bank conflicts)
                             q0 = Q_shared[0 * 32 + lane_id]
                             q1 = Q_shared[1 * 32 + lane_id]
                             q2 = Q_shared[2 * 32 + lane_id]
                             q3 = Q_shared[3 * 32 + lane_id]
 
-                            # Per-warp accumulators
                             o0 = T.alloc_local((1,), accum_dtype)
                             o1 = T.alloc_local((1,), accum_dtype)
                             o2 = T.alloc_local((1,), accum_dtype)
@@ -93,12 +119,9 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                             ls = T.alloc_local((1,), accum_dtype)
                             ls[0] = 0.0
 
-                            # Each warp iterates positions with stride num_warps
-                            for pw in T.serial(T.ceildiv(seq_len, num_warps)):
-                                pos = pw * num_warps + warp_id
-                                if pos < seq_len:
-                                    # Coalesced K loads: 4 contiguous 32-element warp loads
-                                    # instead of 4 strided (lane_id*4+j) loads hitting 2 segments each
+                            for pw in T.serial(T.ceildiv(kv_chunk, num_warps)):
+                                pos = kv_start + pw * num_warps + warp_id
+                                if pos < kv_start + kv_chunk:
                                     k0 = K[
                                         task_id, pos, 0 * 32 + lane_id
                                     ].astype(accum_dtype)
@@ -140,7 +163,6 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                     wt = T.exp2((sc[0] - ms[0]) * log2e)
                                     ls[0] = ls[0] * ed + wt
 
-                                    # Coalesced V loads: same contiguous pattern
                                     v0 = V[
                                         task_id, pos, 0 * 32 + lane_id
                                     ].astype(accum_dtype)
@@ -159,7 +181,7 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                     o2[0] = o2[0] * ed + wt * v2
                                     o3[0] = o3[0] * ed + wt * v3
 
-                            # --- Cross-warp reduction ---
+                            # Cross-warp reduction
                             bm = T.alloc_local((1,), accum_dtype)
                             with T.attr(
                                 max_red,
@@ -274,11 +296,93 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                     )
                                 )
 
-                            # Normalize and write output with contiguous indexing
-                            Out[task_id, 0 * 32 + lane_id] = (bo0[0] / bs[0]).astype(dtype)
-                            Out[task_id, 1 * 32 + lane_id] = (bo1[0] / bs[0]).astype(dtype)
-                            Out[task_id, 2 * 32 + lane_id] = (bo2[0] / bs[0]).astype(dtype)
-                            Out[task_id, 3 * 32 + lane_id] = (bo3[0] / bs[0]).astype(dtype)
+                            Out_partial[task_id, split_id, 0 * 32 + lane_id] = (
+                                bo0[0] / bs[0]
+                            ).astype(dtype)
+                            Out_partial[task_id, split_id, 1 * 32 + lane_id] = (
+                                bo1[0] / bs[0]
+                            ).astype(dtype)
+                            Out_partial[task_id, split_id, 2 * 32 + lane_id] = (
+                                bo2[0] / bs[0]
+                            ).astype(dtype)
+                            Out_partial[task_id, split_id, 3 * 32 + lane_id] = (
+                                bo3[0] / bs[0]
+                            ).astype(dtype)
+
+                            if warp_id == 0 and lane_id == 0:
+                                LSE_partial[task_id, split_id] = (
+                                    bm[0] * log2e + T.log2(bs[0])
+                                )
+
+            return main
+
+        return kernel
+
+    def _make_combine_kernel(self):
+        total_tasks = self.batch * self.num_heads
+        num_split = self.num_split
+        head_dim = self.head_dim
+
+        @tilelang.jit(out_idx=[2], target="auto")
+        def kernel():
+            accum_dtype = "float"
+            dtype = "bfloat16"
+
+            @T.prim_func
+            def main(
+                Out_partial: T.Buffer((total_tasks, num_split, head_dim), dtype),
+                LSE_partial: T.Buffer((total_tasks, num_split), accum_dtype),
+                Out: T.Buffer((total_tasks, head_dim), dtype),
+            ):
+                with T.Kernel(total_tasks, threads=32) as task_id:
+                    lane_id = T.get_thread_binding(0)
+
+                    cur_max = T.alloc_local((1,), accum_dtype)
+                    cur_max[0] = -1e30
+                    for s in T.serial(num_split):
+                        cur_max[0] = T.max(
+                            cur_max[0], LSE_partial[task_id, s]
+                        )
+
+                    sum_w = T.alloc_local((1,), accum_dtype)
+                    sum_w[0] = 0.0
+                    oo0 = T.alloc_local((1,), accum_dtype)
+                    oo1 = T.alloc_local((1,), accum_dtype)
+                    oo2 = T.alloc_local((1,), accum_dtype)
+                    oo3 = T.alloc_local((1,), accum_dtype)
+                    oo0[0] = 0.0
+                    oo1[0] = 0.0
+                    oo2[0] = 0.0
+                    oo3[0] = 0.0
+
+                    for s in T.serial(num_split):
+                        w = T.exp2(LSE_partial[task_id, s] - cur_max[0])
+                        oo0[0] += w * Out_partial[
+                            task_id, s, 0 * 32 + lane_id
+                        ].astype(accum_dtype)
+                        oo1[0] += w * Out_partial[
+                            task_id, s, 1 * 32 + lane_id
+                        ].astype(accum_dtype)
+                        oo2[0] += w * Out_partial[
+                            task_id, s, 2 * 32 + lane_id
+                        ].astype(accum_dtype)
+                        oo3[0] += w * Out_partial[
+                            task_id, s, 3 * 32 + lane_id
+                        ].astype(accum_dtype)
+                        sum_w[0] += w
+
+                    Out[task_id, 0 * 32 + lane_id] = (oo0[0] / sum_w[0]).astype(
+                        dtype
+                    )
+                    Out[task_id, 1 * 32 + lane_id] = (oo1[0] / sum_w[0]).astype(
+                        dtype
+                    )
+                    Out[task_id, 2 * 32 + lane_id] = (oo2[0] / sum_w[0]).astype(
+                        dtype
+                    )
+                    Out[task_id, 3 * 32 + lane_id] = (oo3[0] / sum_w[0]).astype(
+                        dtype
+                    )
 
             return main
 
@@ -291,8 +395,20 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
         K_flat = K.reshape(B * H, S, D)
         V_flat = V.reshape(B * H, S, D)
 
-        if self._best_kernel is None:
-            self._best_kernel = self._kernel()
+        device = Q.device
+        dtype = torch.bfloat16
+        total_tasks = B * H
+        Out_partial = torch.empty(
+            (total_tasks, self.num_split, D), device=device, dtype=dtype
+        )
+        LSE_partial = torch.empty(
+            (total_tasks, self.num_split), device=device, dtype=torch.float32
+        )
 
-        Out_flat = self._best_kernel(Q_flat, K_flat, V_flat)
+        if self._best_split is None:
+            self._best_split = self._split_kernel()
+            self._combine_built = self._combine_kernel()
+
+        self._best_split(Q_flat, K_flat, V_flat, Out_partial, LSE_partial)
+        Out_flat = self._combine_built(Out_partial, LSE_partial)
         return Out_flat.reshape(B, H, 1, D)
