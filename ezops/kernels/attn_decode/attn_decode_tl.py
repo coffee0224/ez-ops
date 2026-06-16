@@ -160,7 +160,7 @@ class _FlashDecodeTileLangBase(BaseKernel):
         return Out_flat.reshape(B, H, 1, D)
 
 
-@register_kernel("attn_decode", "flash_decode_tilelang")
+@register_kernel("attn_decode", "flash_decode_tilelang_tma")
 class FlashDecodeAttnTileLangKernel(_FlashDecodeTileLangBase):
     """TMA-based flash decoding.
 
