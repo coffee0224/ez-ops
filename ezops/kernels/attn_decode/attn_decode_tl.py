@@ -169,7 +169,26 @@ class FlashDecodeAttnTileLangKernel(_FlashDecodeTileLangBase):
     overlaps the next tile's load with the current tile's compute. The
     inner dot-product uses `T.warp_reduce_sum` (shfl) because
     `T.tvm_thread_allreduce` cannot be hosted inside `T.Pipelined`.
+
+    Unlike the LDG variant, this backend prefers **perfect SM balance**
+    over `seq_len` divisibility: num_split is picked so
+    `(total_tasks * num_split) % num_sms == 0`, and the remainder of
+    `seq_len / num_split` is dumped into the last split (slightly larger
+    chunk). Non-last splits may load a partial tail block whose OOB
+    positions land in the next split's data — those positions get their
+    softmax score masked to -inf so they contribute zero weight.
     """
+
+    def _pick_num_split(self):
+        """Perfect-SM-balance num_split (drops seq_len divisibility)."""
+        total_tasks = self.batch * self.num_heads
+        if total_tasks <= 0:
+            return 1
+        min_split = (self.num_sms + total_tasks - 1) // total_tasks
+        for cand in range(min_split, min_split + self.num_sms * 4):
+            if (total_tasks * cand) % self.num_sms == 0:
+                return cand
+        return min_split
 
     def _make_split_kernel(self):
         total_tasks = self.batch * self.num_heads
@@ -179,12 +198,31 @@ class FlashDecodeAttnTileLangKernel(_FlashDecodeTileLangBase):
         seq_len = self.seq_len
         head_dim = self.head_dim
         num_sms = self.num_sms
-        kv_chunk = seq_len // num_split
+
+        # Unequal-chunk distribution:
+        # - Splits 0..num_split-2: kv_chunk_base positions each
+        # - Last split: remainder (>= kv_chunk_base), so the last split's
+        #   chunk is always a multiple of any block_n that divides the
+        #   remainder — keeps the final block of the final split inside
+        #   the K/V buffer (no OOB past seq_len).
+        kv_chunk_base = seq_len // num_split
+        last_split_chunk = seq_len - (num_split - 1) * kv_chunk_base
+        kv_chunk_max = max(kv_chunk_base, last_split_chunk)
+
+        # Restrict block_n to values that keep the last split's last block
+        # within seq_len (last_split_chunk % block_n == 0). Non-last splits
+        # may have partial tail blocks — those reads land in the next
+        # split's data within the K/V buffer, which is safe.
+        all_block_ns = [32, 64, 128]
+        safe_block_ns = [bn for bn in all_block_ns if last_split_chunk % bn == 0]
+        if not safe_block_ns:
+            safe_block_ns = all_block_ns
+        default_block_n = safe_block_ns[0]
 
         def get_configs():
             configs = []
             for nw in [2, 4, 8]:
-                for bn in [32, 64, 128]:
+                for bn in safe_block_ns:
                     if bn % nw == 0:
                         configs.append({"num_warps": nw, "block_n": bn})
             return configs
@@ -202,15 +240,17 @@ class FlashDecodeAttnTileLangKernel(_FlashDecodeTileLangBase):
             accum_dtype = "float"
             attn_scale = 1.0 / (head_dim**0.5)
             log2e = 1.44269504
+            neg_inf = -1e30
             sum_red = T.comm_reducer(lambda x, y: x + y, [T.cast(0, accum_dtype)])
-            max_red = T.comm_reducer(lambda x, y: T.max(x, y), [T.cast(-1e30, accum_dtype)])
+            max_red = T.comm_reducer(lambda x, y: T.max(x, y), [T.cast(neg_inf, accum_dtype)])
 
             if num_warps is None:
                 num_warps = 4
             if block_n is None:
-                block_n = 64
+                block_n = default_block_n
 
             pos_per_warp = block_n // num_warps
+            num_blocks = (kv_chunk_max + block_n - 1) // block_n
 
             @T.prim_func
             def main(
@@ -233,7 +273,15 @@ class FlashDecodeAttnTileLangKernel(_FlashDecodeTileLangBase):
                         if work_id < total_work_units:
                             split_id = work_id % num_split
                             task_id = work_id // num_split
-                            kv_start = split_id * kv_chunk
+                            kv_start = split_id * kv_chunk_base
+                            # Last split ends at seq_len; others end at the
+                            # next split's start. OOB positions (in tail
+                            # blocks of non-last splits) are masked below.
+                            kv_end = T.if_then_else(
+                                split_id == num_split - 1,
+                                seq_len,
+                                (split_id + 1) * kv_chunk_base,
+                            )
 
                             for d in T.Parallel(head_dim):
                                 Q_shared[d] = Q[task_id, d].astype(accum_dtype)
@@ -252,11 +300,9 @@ class FlashDecodeAttnTileLangKernel(_FlashDecodeTileLangBase):
                             T.clear(o2)
                             T.clear(o3)
                             ms = T.alloc_local((1,), accum_dtype)
-                            ms[0] = -1e30
+                            ms[0] = neg_inf
                             ls = T.alloc_local((1,), accum_dtype)
                             ls[0] = 0.0
-
-                            num_blocks = T.ceildiv(kv_chunk, block_n)
 
                             # Pipelined TMA tile loads + per-position SIMT compute.
                             # Inner dot-product uses warp-level shfl reduction
@@ -284,6 +330,8 @@ class FlashDecodeAttnTileLangKernel(_FlashDecodeTileLangBase):
 
                                 for j in T.serial(pos_per_warp):
                                     local_pos = warp_id * pos_per_warp + j
+                                    global_pos = block_start + local_pos
+
                                     k0 = K_shared[
                                         local_pos, 0 * 32 + lane_id
                                     ].astype(accum_dtype)
@@ -302,6 +350,12 @@ class FlashDecodeAttnTileLangKernel(_FlashDecodeTileLangBase):
 
                                     sc = T.alloc_local((1,), accum_dtype)
                                     sc[0] = T.warp_reduce_sum(sp[0]) * attn_scale
+                                    # Mask out OOB positions (read from next
+                                    # split's data within the K/V buffer) so
+                                    # they contribute zero softmax weight.
+                                    sc[0] = T.if_then_else(
+                                        global_pos >= kv_end, neg_inf, sc[0]
+                                    )
 
                                     om = T.alloc_local((1,), accum_dtype)
                                     om[0] = ms[0]
