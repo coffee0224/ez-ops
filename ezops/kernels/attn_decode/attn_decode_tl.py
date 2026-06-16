@@ -18,6 +18,15 @@ from ...registry import register_kernel
 
 @register_kernel("attn_decode", "flash_decode_tilelang")
 class FlashDecodeAttnTileLangKernel(BaseKernel):
+    """Flash-decoding attention with TMA-based tile loads.
+
+    Persistent grid (num_sms) iterates over (task, kv_split) work units so all
+    SMs stay busy. Each work unit processes its KV chunk in BLOCK_N-sized
+    tiles loaded via TMA (T.copy + T.Pipelined), with per-warp online softmax
+    followed by a cross-warp reduction. A second tiny kernel combines the
+    per-split outputs.
+    """
+
     def __init__(self, batch, num_heads, seq_len, head_dim):
         self.batch = batch
         self.num_heads = num_heads
@@ -31,15 +40,15 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
         self._combine_built = None
 
     def _pick_num_split(self):
-        """Pick num_split so that batch*num_heads*num_split fills all SMs with even balance.
+        """Pick num_split so that batch*num_heads*num_split fills all SMs evenly.
 
-        For (1,16) on 36 SMs: smallest k where 16*k is a multiple of 36 is k=9 (144 units, 4/SM).
+        For (1,16) on 36 SMs: smallest k where 16*k is a multiple of 36 is k=9
+        (144 units, 4/SM). Also require seq_len % k == 0 for clean chunking.
         """
         total_tasks = self.batch * self.num_heads
         if total_tasks <= 0:
             return 1
         min_split = (self.num_sms + total_tasks - 1) // total_tasks
-        # require divisibility for both balance and seq_len chunking
         for cand in range(min_split, min_split + self.num_sms):
             if (
                 self.seq_len % cand == 0
@@ -62,11 +71,22 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
         kv_chunk = seq_len // num_split
 
         def get_configs():
-            return [{"num_warps": nw} for nw in [2, 4, 8, 16]]
+            configs = []
+            for nw in [2, 4, 8]:
+                for bn in [32, 64, 128]:
+                    if bn % nw == 0:
+                        configs.append({"num_warps": nw, "block_n": bn})
+            return configs
+
+        def get_pass_configs():
+            # T.Pipelined + cross-warp allreduce combo trips the producer-
+            # consumer warp-specialization pass; disable it (matches the
+            # tilelang flash_decoding example).
+            return {tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
 
         @autotune(configs=get_configs(), warmup=5, rep=50)
-        @tilelang.jit(target="auto")
-        def kernel(num_warps=None):
+        @tilelang.jit(target="auto", pass_configs=get_pass_configs())
+        def kernel(num_warps=None, block_n=None):
             dtype = "bfloat16"
             accum_dtype = "float"
             attn_scale = 1.0 / (head_dim**0.5)
@@ -76,6 +96,10 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
 
             if num_warps is None:
                 num_warps = 4
+            if block_n is None:
+                block_n = 64
+
+            pos_per_warp = block_n // num_warps
 
             @T.prim_func
             def main(
@@ -90,6 +114,8 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                     warp_id = T.get_thread_binding(1)
 
                     Q_shared = T.alloc_shared((head_dim,), accum_dtype)
+                    K_shared = T.alloc_shared((block_n, head_dim), dtype)
+                    V_shared = T.alloc_shared((block_n, head_dim), dtype)
 
                     for it in T.serial(num_iters):
                         work_id = it * num_sms + block_id
@@ -98,6 +124,7 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                             task_id = work_id // num_split
                             kv_start = split_id * kv_chunk
 
+                            # Load Q cooperatively into shared (fp32 for accuracy)
                             for d in T.Parallel(head_dim):
                                 Q_shared[d] = Q[task_id, d].astype(accum_dtype)
 
@@ -119,42 +146,57 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                             ls = T.alloc_local((1,), accum_dtype)
                             ls[0] = 0.0
 
-                            for pw in T.serial(T.ceildiv(kv_chunk, num_warps)):
-                                pos = kv_start + pw * num_warps + warp_id
-                                if pos < kv_start + kv_chunk:
-                                    k0 = K[
-                                        task_id, pos, 0 * 32 + lane_id
+                            num_blocks = T.ceildiv(kv_chunk, block_n)
+
+                            # Pipelined TMA tile loads + per-position SIMT compute.
+                            # The inner dot-product reduction uses warp-level shfl
+                            # (T.warp_reduce_sum) instead of tvm_thread_allreduce
+                            # because allreduce cannot be hosted inside T.Pipelined.
+                            for kb in T.Pipelined(num_blocks, num_stages=2):
+                                block_start = kv_start + kb * block_n
+
+                                # TMA bulk load of K and V tiles into shared mem
+                                T.copy(
+                                    K[
+                                        task_id,
+                                        block_start : block_start + block_n,
+                                        :,
+                                    ],
+                                    K_shared,
+                                )
+                                T.copy(
+                                    V[
+                                        task_id,
+                                        block_start : block_start + block_n,
+                                        :,
+                                    ],
+                                    V_shared,
+                                )
+
+                                # Each warp handles pos_per_warp consecutive
+                                # positions within the loaded tile.
+                                for j in T.serial(pos_per_warp):
+                                    local_pos = warp_id * pos_per_warp + j
+                                    k0 = K_shared[
+                                        local_pos, 0 * 32 + lane_id
                                     ].astype(accum_dtype)
-                                    k1 = K[
-                                        task_id, pos, 1 * 32 + lane_id
+                                    k1 = K_shared[
+                                        local_pos, 1 * 32 + lane_id
                                     ].astype(accum_dtype)
-                                    k2 = K[
-                                        task_id, pos, 2 * 32 + lane_id
+                                    k2 = K_shared[
+                                        local_pos, 2 * 32 + lane_id
                                     ].astype(accum_dtype)
-                                    k3 = K[
-                                        task_id, pos, 3 * 32 + lane_id
+                                    k3 = K_shared[
+                                        local_pos, 3 * 32 + lane_id
                                     ].astype(accum_dtype)
 
                                     sp = T.alloc_local((1,), accum_dtype)
                                     sp[0] = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3
 
+                                    # Warp-level reduction via shfl (faster than
+                                    # allreduce and works inside T.Pipelined).
                                     sc = T.alloc_local((1,), accum_dtype)
-                                    with T.attr(
-                                        sum_red,
-                                        "reduce_scope",
-                                        T.reinterpret(T.uint64(0), dtype="handle"),
-                                    ):
-                                        T.evaluate(
-                                            T.tvm_thread_allreduce(
-                                                T.uint32(1),
-                                                sp[0],
-                                                True,
-                                                sc[0],
-                                                lane_id,
-                                                dtype="handle",
-                                            )
-                                        )
-                                    sc[0] *= attn_scale
+                                    sc[0] = T.warp_reduce_sum(sp[0]) * attn_scale
 
                                     om = T.alloc_local((1,), accum_dtype)
                                     om[0] = ms[0]
@@ -163,17 +205,17 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                     wt = T.exp2((sc[0] - ms[0]) * log2e)
                                     ls[0] = ls[0] * ed + wt
 
-                                    v0 = V[
-                                        task_id, pos, 0 * 32 + lane_id
+                                    v0 = V_shared[
+                                        local_pos, 0 * 32 + lane_id
                                     ].astype(accum_dtype)
-                                    v1 = V[
-                                        task_id, pos, 1 * 32 + lane_id
+                                    v1 = V_shared[
+                                        local_pos, 1 * 32 + lane_id
                                     ].astype(accum_dtype)
-                                    v2 = V[
-                                        task_id, pos, 2 * 32 + lane_id
+                                    v2 = V_shared[
+                                        local_pos, 2 * 32 + lane_id
                                     ].astype(accum_dtype)
-                                    v3 = V[
-                                        task_id, pos, 3 * 32 + lane_id
+                                    v3 = V_shared[
+                                        local_pos, 3 * 32 + lane_id
                                     ].astype(accum_dtype)
 
                                     o0[0] = o0[0] * ed + wt * v0
@@ -181,7 +223,7 @@ class FlashDecodeAttnTileLangKernel(BaseKernel):
                                     o2[0] = o2[0] * ed + wt * v2
                                     o3[0] = o3[0] * ed + wt * v3
 
-                            # Cross-warp reduction
+                            # Cross-warp reduction (same as split-KV version)
                             bm = T.alloc_local((1,), accum_dtype)
                             with T.attr(
                                 max_red,
