@@ -12,6 +12,30 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
   return val;
 }
 
+
+__global__ void reduce_kernel_v0_baseline(const float* __restrict__ A, float* __restrict__ Out, int n) {
+  __shared__ float sdata[BLOCK_SIZE];
+
+  int tid = threadIdx.x;
+  int i = blockIdx.x * blockDim.x + tid;
+
+  if (i < n) {
+    sdata[i] = A[i];
+  } else {
+    sdata[i] = 0;
+  }
+
+  for(int s = 1; s < blockDim.x; s *= 2) {
+    if (i % (2*s) == 0) {
+      sdata[i] += sdata[i+s];
+    }
+  }
+
+  if (tid == 0) {
+    atomicAdd(Out, sdata[0]);
+  }
+}
+
 // Sum reduction: Out[0] = sum(A). Each block reduces its chunk via warp
 // shuffles and accumulates into Out with a single atomicAdd per block.
 __global__ void reduce_kernel(const float* __restrict__ A, float* __restrict__ Out, int n) {
@@ -43,7 +67,7 @@ void reduce_cu(tvm::ffi::TensorView A, tvm::ffi::TensorView Out) {
 
   // Out must be zeroed before the atomic accumulation
   cudaMemsetAsync(Out.data_ptr(), 0, sizeof(float), stream);
-  reduce_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+  reduce_kernel_v0_baseline<<<grid, BLOCK_SIZE, 0, stream>>>(
       static_cast<const float*>(A.data_ptr()),
       static_cast<float*>(Out.data_ptr()),
       static_cast<int>(n));
