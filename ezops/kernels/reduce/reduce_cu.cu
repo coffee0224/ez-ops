@@ -20,15 +20,17 @@ __global__ void reduce_kernel_v0_baseline(const float* __restrict__ A, float* __
   int i = blockIdx.x * blockDim.x + tid;
 
   if (i < n) {
-    sdata[i] = A[i];
+    sdata[tid] = A[i];
   } else {
-    sdata[i] = 0;
+    sdata[tid] = 0;
   }
 
+  __syncthreads();
   for(int s = 1; s < blockDim.x; s *= 2) {
-    if (i % (2*s) == 0) {
-      sdata[i] += sdata[i+s];
+    if (tid % (2*s) == 0) {
+      sdata[tid] += sdata[tid+s];
     }
+    __syncthreads();
   }
 
   if (tid == 0) {
