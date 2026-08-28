@@ -1,4 +1,5 @@
 import argparse
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -9,6 +10,7 @@ from tabulate import tabulate
 
 from ezops import ReduceOp, list_backends
 from ezops.ops.utils.bench import bench_kernel
+from ezops.ops.utils.accuracy import SQNR_THRESHOLD_DB, check_determinism, check_input_readonly, sqnr_db
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -79,11 +81,21 @@ def _compute_sol(roofline, profile, input_bytes):
     }
 
 
+def _fmt_sqnr(v: float) -> str:
+    return "inf" if math.isinf(v) else f"{v:.1f}"
+
+
 def _run_workload(n, label, profile, backends):
-    """Run all backends for a single workload and print two tables."""
+    """Run all backends for a single workload and print two tables.
+
+    Accuracy phase mirrors the xpuoj judge order (all untimed): one call
+    checked against the ref via SQNR + allclose, then determinism (two
+    calls, byte-for-byte output compare), then input read-only.
+    """
     print(f"\n{'=' * 60}")
     print(f"  Reduce workload: {label}  (n={n})")
     print(f"  A: ({n},)  Out: (1,)")
+    print(f"  pass = allclose AND sqnr >= {SQNR_THRESHOLD_DB:.0f} dB; det = byte-identical over 2 calls")
     print(f"{'=' * 60}\n")
 
     torch.manual_seed(42)
@@ -106,12 +118,18 @@ def _run_workload(n, label, profile, backends):
             _, Out = op.gen_data()
             op(A, Out)
             max_diff = (Out - Out_ref).abs().max().item()
-            passed = op.check(Out, Out_ref)
+            sqnr = sqnr_db(Out_ref, Out)
+            passed = op.check(Out, Out_ref) and sqnr >= SQNR_THRESHOLD_DB
+            det_ok = check_determinism(op, inputs=(A,), outputs=Out)
+            ro_ok = check_input_readonly(op, inputs=(A,), outputs=Out)
             ms = bench_kernel(op, args=(A, Out), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
             speedup = ref_ms / ms if ms > 0 else float("inf")
             sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
             rows.append([
-                backend, f"{max_diff:.2e}", "PASS" if passed else "FAIL",
+                backend, f"{max_diff:.2e}", _fmt_sqnr(sqnr),
+                "PASS" if passed else "FAIL",
+                "OK" if det_ok else "NONDET",
+                "OK" if ro_ok else "MUTATED",
                 f"{ms:.4f}", f"{speedup:.2f}x",
                 f"{sol_score:.1f}x" if sol_score is not None else "—",
             ])
@@ -121,14 +139,14 @@ def _run_workload(n, label, profile, backends):
 
     ref_sol = sol["theo_min_s"] / (ref_ms / 1000) if sol else None
     rows.append([
-        "ref", "—", "—", f"{ref_ms:.4f}", "1.00x",
+        "ref", "—", "—", "—", "—", "—", f"{ref_ms:.4f}", "1.00x",
         f"{ref_sol:.1f}x" if ref_sol is not None else "—",
     ])
 
     # Table 1: Performance
     print(tabulate(
         rows,
-        headers=["backend", "max_diff", "result", "latency(ms)", "speedup", "sol-score"],
+        headers=["backend", "max_diff", "sqnr(dB)", "result", "det", "input", "latency(ms)", "speedup", "sol-score"],
         tablefmt="github",
     ))
 
