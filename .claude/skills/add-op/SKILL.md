@@ -220,6 +220,7 @@ then iterate over each workload, running all backends and printing per-workload 
 
 ```python
 import argparse
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -230,6 +231,7 @@ from tabulate import tabulate
 
 from ezops import <PascalCase>Op, list_backends
 from ezops.ops.utils.bench import bench_kernel
+from ezops.ops.utils.accuracy import SQNR_THRESHOLD_DB, check_determinism, check_input_readonly, sqnr_db
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -298,11 +300,21 @@ def _compute_sol(roofline, profile, input_bytes):
     }
 
 
+def _fmt_sqnr(v: float) -> str:
+    return "inf" if math.isinf(v) else f"{v:.1f}"
+
+
 def _run_workload(<params>, label, profile, backends):
-    """Run all backends for a single workload and print two tables."""
+    """Run all backends for a single workload and print two tables.
+
+    Accuracy phase mirrors the xpuoj judge order (all untimed): one call
+    checked against the ref via SQNR + allclose, then determinism (two
+    calls, byte-for-byte output compare), then input read-only.
+    """
     print(f"\n{'=' * 60}")
     print(f"  <OP_DISPLAY> workload: {label}  (<param_summary>)")
     print(f"  <tensor_shape_summary>")
+    print(f"  pass = allclose AND sqnr >= {SQNR_THRESHOLD_DB:.0f} dB; det = byte-identical over 2 calls")
     print(f"{'=' * 60}\n")
 
     torch.manual_seed(42)
@@ -326,12 +338,18 @@ def _run_workload(<params>, label, profile, backends):
             <fresh_output> = <clone_or_empty>
             op(<input_args>, <output_arg>)
             max_diff = (<output> - <ref_output>).abs().max().item()
-            passed = op.check(<output>, <ref_output>)
+            sqnr = sqnr_db(<ref_output>, <output>)
+            passed = op.check(<output>, <ref_output>) and sqnr >= SQNR_THRESHOLD_DB
+            det_ok = check_determinism(op, inputs=(<input_args>,), outputs=<output_arg>)
+            ro_ok = check_input_readonly(op, inputs=(<input_args>,), outputs=<output_arg>)
             ms = bench_kernel(op, args=(<bench_args>), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
             speedup = ref_ms / ms if ms > 0 else float("inf")
             sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
             rows.append([
-                backend, f"{max_diff:.2e}", "PASS" if passed else "FAIL",
+                backend, f"{max_diff:.2e}", _fmt_sqnr(sqnr),
+                "PASS" if passed else "FAIL",
+                "OK" if det_ok else "NONDET",
+                "OK" if ro_ok else "MUTATED",
                 f"{ms:.4f}", f"{speedup:.2f}x",
                 f"{sol_score:.1f}x" if sol_score is not None else "—",
             ])
@@ -341,14 +359,14 @@ def _run_workload(<params>, label, profile, backends):
 
     ref_sol = sol["theo_min_s"] / (ref_ms / 1000) if sol else None
     rows.append([
-        "ref", "—", "—", f"{ref_ms:.4f}", "1.00x",
+        "ref", "—", "—", "—", "—", "—", f"{ref_ms:.4f}", "1.00x",
         f"{ref_sol:.1f}x" if ref_sol is not None else "—",
     ])
 
     # Table 1: Performance
     print(tabulate(
         rows,
-        headers=["backend", "max_diff", "result", "latency(ms)", "speedup", "sol-score"],
+        headers=["backend", "max_diff", "sqnr(dB)", "result", "det", "input", "latency(ms)", "speedup", "sol-score"],
         tablefmt="github",
     ))
 
@@ -405,10 +423,15 @@ if __name__ == "__main__":
 Key conventions for the benchmark:
 - **Workload pattern**: `WORKLOADS` is a list of tuples `(param1, param2, ..., "label")`. Each tuple contains the op constructor parameters followed by a human-readable label (e.g. model layer name). `main()` iterates over workloads and calls `_run_workload` for each.
 - Each workload gets its own performance table and SOL table, separated by a header banner showing the workload label and parameter summary.
-- Main table columns: `backend`, `max_diff`, `result`, `latency(ms)`, `speedup`, `sol-score`.
+- Main table columns: `backend`, `max_diff`, `sqnr(dB)`, `result`, `det`, `input`, `latency(ms)`, `speedup`, `sol-score`.
 - `ref` row at the bottom shows PyTorch reference latency as the speedup baseline (1.00x).
 - The try/except covers the entire backend run; unimplemented backends print the exception and are skipped (no output row).
-- **Correctness** uses `op.check(output, ref_output)` which applies `torch.allclose` with the op's own `_atol` / `_rtol` defaults (inherited from `Op` base class: `1e-6` / `1e-5`). Ops can override these in `__init__` if needed.
+- **Accuracy phase mirrors the xpuoj judge order** (all untimed, before any warmup/timing), using helpers from `ezops.ops.utils.accuracy`:
+  1. **SQNR vs ref** (one call): `sqnr_db(ref, out) = 10·log10(‖ref‖² / ‖ref-out‖²)` in dB. `inf` means bitwise-identical to ref. Threshold `SQNR_THRESHOLD_DB = 28.0` (xpuoj convention): healthy fp32/bf16 kernels land ≥ 50 dB; single-digit dB means a structural bug (bad indexing, misaligned copy), not rounding noise.
+  2. **Determinism** (`check_determinism`): two calls on the same input, outputs compared **byte-for-byte** (uint8 view — distinguishes ±0.0 and NaN payloads). Cross-block `atomic_add` accumulation or unordered reductions show up as `NONDET`; single-block / fixed-order reductions are `OK`. Nondeterministic kernels fail the xpuoj judge, so `NONDET` is a real finding to fix (e.g. two-stage reduction), not a flaky check.
+  3. **Input read-only** (`check_input_readonly`): input tensors must stay byte-identical after a call (`OK` / `MUTATED`).
+- `passed` combines `op.check(output, ref_output)` (per-element `torch.allclose` with the op's `_atol` / `_rtol`, defaults `1e-6` / `1e-5` from the `Op` base class; ops can override in `__init__`) **AND** `sqnr >= SQNR_THRESHOLD_DB`. The workload banner states this pass criterion.
+- Adapt `inputs=(...)` / `outputs=...` in the two check calls to the op's tensor signature: all input tensors go to `inputs`, all kernel-written tensors (in-place outputs, workspaces) go to `outputs`.
 - **Latency** uses `bench_kernel` from `ezops.ops.utils.bench` which follows the NVIDIA SOL-ExecBench protocol: L2 cache flush before every iteration, input tensor clone pool to avoid cache effects, multiple independent trials with median selection.
 - **SOL (Speed of Light)** analysis:
   - `sol-score = theoretical_min / latency` — upper bound is 1.0 (100% of theoretical peak).
@@ -440,3 +463,12 @@ And verify the roofline works:
 ```bash
 uv run python -c "from ezops import <PascalCase>Op; op = <PascalCase>Op(<small_params>); print(op.get_roofline())"
 ```
+
+Once the kernel backends are implemented, run the benchmark and confirm the accuracy
+columns render and report honestly — `sqnr(dB)` well above 28, `det` OK, `input` OK:
+```bash
+uv run python benchmarks/bench_<op_name>.py -k <backend>
+```
+`NONDET` or `MUTATED` are findings to fix in the kernel (e.g. replace cross-block
+atomics with a two-stage reduction), not harness false positives — the harness itself
+is validated: the ref backend always reports `det OK`.
