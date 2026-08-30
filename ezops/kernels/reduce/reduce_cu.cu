@@ -32,30 +32,6 @@ __global__ void reduce_kernel_v0(const float* __restrict__ A, float* __restrict_
 }
 
 // 消除 warp_divergence
-// __global__ void reduce_kernel_v1(const float* __restrict__ A, float* __restrict__ Out, int n) {
-//   __shared__ float sdata[BLOCK_SIZE];
-
-//   int tid = threadIdx.x;
-//   int i = blockIdx.x * blockDim.x + tid;
-
-//   if (i < n) {
-//     sdata[tid] = A[i];
-//   } else {
-//     sdata[tid] = 0;
-//   }
-//   __syncthreads();
-  
-//   for(int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
-//     if (tid < s) {
-//       sdata[tid] += sdata[tid+s];
-//     }
-//     __syncthreads();
-//   }
-
-//   if (tid == 0) {
-//     atomicAdd(Out, sdata[0]);
-//   }
-// }
 
 __global__ void reduce_kernel_v1(const float* __restrict__ A, float* __restrict__ Out, int n) {
   __shared__ float sdata[BLOCK_SIZE];
@@ -74,6 +50,56 @@ __global__ void reduce_kernel_v1(const float* __restrict__ A, float* __restrict_
     int index = 2 * s * tid;
     if (index < blockDim.x) {
       sdata[index] += sdata[index+s];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    atomicAdd(Out, sdata[0]);
+  }
+}
+
+__global__ void reduce_kernel_v2(const float* __restrict__ A, float* __restrict__ Out, int n) {
+  __shared__ float sdata[BLOCK_SIZE];
+
+  int tid = threadIdx.x;
+  int i = blockIdx.x * blockDim.x + tid;
+
+  if (i < n) {
+    sdata[tid] = A[i];
+  } else {
+    sdata[tid] = 0;
+  }
+  __syncthreads();
+  
+  for(int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid+s];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    atomicAdd(Out, sdata[0]);
+  }
+}
+
+__global__ void reduce_kernel_v3(const float* __restrict__ A, float* __restrict__ Out, int n) {
+  __shared__ float sdata[BLOCK_SIZE];
+
+  int tid = threadIdx.x;
+  int i = blockIdx.x * blockDim.x * 2 + tid;
+
+  if (i < n) {
+    sdata[tid] = A[i] + A[i + BLOCK_SIZE];
+  } else {
+    sdata[tid] = 0;
+  }
+  __syncthreads();
+  
+  for(int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid+s];
     }
     __syncthreads();
   }
@@ -122,15 +148,26 @@ void reduce_cu(tvm::ffi::TensorView A, tvm::ffi::TensorView Out) {
 
   // Out must be zeroed before the atomic accumulation
   cudaMemsetAsync(Out.data_ptr(), 0, sizeof(float), stream);
-  reduce_kernel_v0<<<grid, BLOCK_SIZE, 0, stream>>>(
-      static_cast<const float*>(A.data_ptr()),
-      static_cast<float*>(Out.data_ptr()),
-      static_cast<int>(n));
+  // reduce_kernel_v0<<<grid, BLOCK_SIZE, 0, stream>>>(
+  //     static_cast<const float*>(A.data_ptr()),
+  //     static_cast<float*>(Out.data_ptr()),
+  //     static_cast<int>(n));
 
   // reduce_kernel_v1<<<grid, BLOCK_SIZE, 0, stream>>>(
   //     static_cast<const float*>(A.data_ptr()),
   //     static_cast<float*>(Out.data_ptr()),
   //     static_cast<int>(n));
+
+  // reduce_kernel_v2<<<grid, BLOCK_SIZE, 0, stream>>>(
+  //     static_cast<const float*>(A.data_ptr()),
+  //     static_cast<float*>(Out.data_ptr()),
+  //     static_cast<int>(n));
+
+  grid = (n + BLOCK_SIZE * 2 - 1) / (BLOCK_SIZE * 2);
+  reduce_kernel_v3<<<grid, BLOCK_SIZE, 0, stream>>>(
+      static_cast<const float*>(A.data_ptr()),
+      static_cast<float*>(Out.data_ptr()),
+      static_cast<int>(n));
 
   // reduce_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
   //     static_cast<const float*>(A.data_ptr()),
