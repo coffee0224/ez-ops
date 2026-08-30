@@ -19,7 +19,7 @@ from benchmarks.hardware.gpu_specs import detect_profile
 BACKENDS = list_backends("reduce")
 print(BACKENDS)
 WARMUP = 10
-N_REPEAT = 50
+N_REPEAT = 2000
 N_TRIALS = 3
 
 WORKLOADS = [
@@ -35,7 +35,8 @@ def _detect_gpu_profile():
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         if r.returncode != 0:
             return None
@@ -105,8 +106,11 @@ def _run_workload(n, label, profile, backends):
     roofline = ref_op.get_roofline()
 
     ref_ms = bench_kernel(
-        ref_op._ref_forward, args=(A, Out_ref),
-        n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS,
+        ref_op._ref_forward,
+        args=(A, Out_ref),
+        n_warmup=WARMUP,
+        n_repeat=N_REPEAT,
+        n_trials=N_TRIALS,
     )
 
     sol = _compute_sol(roofline, profile, A.nbytes) if profile else None
@@ -125,30 +129,56 @@ def _run_workload(n, label, profile, backends):
             ms = bench_kernel(op, args=(A, Out), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
             speedup = ref_ms / ms if ms > 0 else float("inf")
             sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
-            rows.append([
-                backend, f"{max_diff:.2e}", _fmt_sqnr(sqnr),
-                "PASS" if passed else "FAIL",
-                "OK" if det_ok else "NONDET",
-                "OK" if ro_ok else "MUTATED",
-                f"{ms:.4f}", f"{speedup:.2f}x",
-                f"{sol_score:.1f}x" if sol_score is not None else "—",
-            ])
+            rows.append(
+                [
+                    backend,
+                    f"{max_diff:.2e}",
+                    _fmt_sqnr(sqnr),
+                    "PASS" if passed else "FAIL",
+                    "OK" if det_ok else "NONDET",
+                    "OK" if ro_ok else "MUTATED",
+                    f"{ms:.4f}",
+                    f"{speedup:.2f}x",
+                    f"{sol_score:.1f}x" if sol_score is not None else "—",
+                ]
+            )
         except Exception as e:
             print(e)
             continue
 
     ref_sol = sol["theo_min_s"] / (ref_ms / 1000) if sol else None
-    rows.append([
-        "ref", "—", "—", "—", "—", "—", f"{ref_ms:.4f}", "1.00x",
-        f"{ref_sol:.1f}x" if ref_sol is not None else "—",
-    ])
+    rows.append(
+        [
+            "ref",
+            "—",
+            "—",
+            "—",
+            "—",
+            "—",
+            f"{ref_ms:.4f}",
+            "1.00x",
+            f"{ref_sol:.1f}x" if ref_sol is not None else "—",
+        ]
+    )
 
     # Table 1: Performance
-    print(tabulate(
-        rows,
-        headers=["backend", "max_diff", "sqnr(dB)", "result", "det", "input", "latency(ms)", "speedup", "sol-score"],
-        tablefmt="github",
-    ))
+    print(
+        tabulate(
+            rows,
+            headers=[
+                "backend",
+                "max_diff",
+                "sqnr(dB)",
+                "result",
+                "det",
+                "input",
+                "latency(ms)",
+                "speedup",
+                "sol-score",
+            ],
+            tablefmt="github",
+        )
+    )
 
     # Table 2: SOL analysis
     if sol:
@@ -164,10 +194,14 @@ def _run_workload(n, label, profile, backends):
 
 def _parse_args():
     parser = argparse.ArgumentParser(add_help=False, description="Reduce kernel benchmark")
-    parser.add_argument("-h", action="store_true", dest="list_backends",
-                        help="List available backends and exit")
-    parser.add_argument("-k", "--backends", type=str, default=None,
-                        help="Comma-separated list of backends to benchmark (ref is always included)")
+    parser.add_argument("-h", action="store_true", dest="list_backends", help="List available backends and exit")
+    parser.add_argument(
+        "-k",
+        "--backends",
+        type=str,
+        default=None,
+        help="Comma-separated list of backends to benchmark (ref is always included)",
+    )
     return parser.parse_args()
 
 
