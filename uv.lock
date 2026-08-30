@@ -136,7 +136,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.3" },
-    { name = "tilelang", specifier = ">=0.1.10" },
+    { name = "tilelang", specifier = "==0.1.13" },
     { name = "torch", specifier = ">=2.12.0" },
     { name = "torchvision", specifier = ">=0.27.0" },
 ]
@@ -761,7 +761,7 @@ wheels = [
 
 [[package]]
 name = "tilelang"
-version = "0.1.10"
+version = "0.1.13"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
@@ -776,12 +776,12 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "z3-solver" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/77/5c/07146b4527656102e48d21c2599aa80477e83ea3f149ac0df3b15a247bd4/tilelang-0.1.10.tar.gz", hash = "sha256:d8813e668fcf75843bc2d68c633c352b419c1e292895a6038a4aadd943e56c2b", size = 93184128, upload-time = "2026-05-25T03:58:57.006Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/f8/01/a0cfbbea3d3306c98c86da89246058f716e001e116b149c2ae7dff856791/tilelang-0.1.13.tar.gz", hash = "sha256:5fd0ec87204e576634bd70630f6a8f846c22104726351e46474b963a3e8a9923", size = 94563987, upload-time = "2026-08-03T05:57:33.133Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/76/0f/e5e01399adb5110bf885e19e879229e3fc578e1e035939f601365305c825/tilelang-0.1.10-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:246084babf0f6801ad2b8ac1d58cead37520974ae399247c89d42b68872d2cf9", size = 38492226, upload-time = "2026-05-25T03:55:30.729Z" },
-    { url = "https://files.pythonhosted.org/packages/b0/66/ab4301dc38ca9f09832df2936c73388c611c198dc938634acb6ce80dfa74/tilelang-0.1.10-cp38-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:85180d1a96defeecdf52d5d075a31c3fc551d8485981e6b636762a9cd7eb02fe", size = 49768455, upload-time = "2026-05-25T03:56:17.081Z" },
-    { url = "https://files.pythonhosted.org/packages/92/af/a3dfc43dad228a6e560863f071865d5a27c35b050a9fc431641cb07135d1/tilelang-0.1.10-cp38-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:15437e5f0daa0863ac9a5386007847c94070f5ab3234d040bc947afdf2f57100", size = 45629488, upload-time = "2026-05-25T03:57:00.374Z" },
-    { url = "https://files.pythonhosted.org/packages/c3/36/2096dce95c20e13be5b5ce852190ca4b4ac41c7fd9b91a0be98353598153/tilelang-0.1.10-cp38-abi3-win_amd64.whl", hash = "sha256:93dd078113d275352698a6e72a91e80e5b0263d22a005109b3db2c1c016ea105", size = 33692452, upload-time = "2026-05-25T03:57:32.576Z" },
+    { url = "https://files.pythonhosted.org/packages/29/5e/474913a44c95d7d7c4b0675c14119e3ecced238bb22f57b985bfb3c7b8bd/tilelang-0.1.13-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:158180e233e5a7fb3b49a2c56a6c0852a3e04422bdaf39f37dea40e613957181", size = 38674409, upload-time = "2026-08-03T05:57:20.075Z" },
+    { url = "https://files.pythonhosted.org/packages/e3/7a/3536de223f110b17edc2d75423e464ab7f509d77a90363f916d03c69c3eb/tilelang-0.1.13-cp38-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:a6f0a90330d7abaae9aac56c27935fcfb4a5b27bbbbe9aaa918cf2245aecdd0e", size = 50976333, upload-time = "2026-08-03T05:57:23.821Z" },
+    { url = "https://files.pythonhosted.org/packages/6d/e8/76757bb0117cb69d42fa7f9cb22f728e3145ccf2be4a1c1154a2eedcc2b7/tilelang-0.1.13-cp38-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:4ab9d688b4a3294f5d5f6b367b69c4fa9a3f9739c46d3f6cf221d79b6843db72", size = 46712763, upload-time = "2026-08-03T05:57:26.793Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/83/1a3863c38465cde8cb4a529a09bfa15cd89e6f8ca716034c9ce7a5aac863/tilelang-0.1.13-cp38-abi3-win_amd64.whl", hash = "sha256:0247859df19cad8d2745acb64beef9a30def9a0cf401b861e5436f601cbefde4", size = 34377512, upload-time = "2026-08-03T05:57:29.678Z" },
 ]
 
 [[package]]
