@@ -197,7 +197,7 @@ __global__ void reduce_kernel_v5(const float* __restrict__ A, float* __restrict_
 
 __device__ __forceinline__ float warp_reduce_sum(float val) {
   #pragma unroll
-  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
     val += __shfl_down_sync(0xffffffff, val, offset);
   }
   return val;
@@ -206,21 +206,27 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 // shuffles and accumulates into Out with a single atomicAdd per block.
 __global__ void reduce_kernel_v6(const float* __restrict__ A, float* __restrict__ Out, int n) {
   int tid = threadIdx.x;
-  int idx = blockIdx.x * BLOCK_SIZE + tid;
-  float val = (idx < n) ? __ldg(A + idx) : 0.0f;
+  int idx = blockIdx.x * BLOCK_SIZE * 2 + tid;
+  float val1 = (idx < n) ? __ldg(A + idx) : 0.0f;
+  float val2 = (idx < n) ? __ldg(A + idx + BLOCK_SIZE) : 0.0f; 
 
-  val = warp_reduce_sum(val);
+  val1 = warp_reduce_sum(val1);
+  val2 = warp_reduce_sum(val2);
 
-  __shared__ float s_warp[NUM_WARPS];
+  __shared__ float s_warp[NUM_WARPS * 2];
   int warp_id = tid / WARP_SIZE;
   int lane_id = tid % WARP_SIZE;
-  if (lane_id == 0) s_warp[warp_id] = val;
+  if (lane_id == 0) {
+    s_warp[warp_id] = val1;
+    s_warp[warp_id + NUM_WARPS] = val2;
+  }
+
   __syncthreads();
 
   if (warp_id == 0) {
-    val = (lane_id < NUM_WARPS) ? s_warp[lane_id] : 0.0f;
-    val = warp_reduce_sum(val);
-    if (lane_id == 0) atomicAdd(Out, val);
+    val1 = (lane_id < NUM_WARPS * 2) ? s_warp[lane_id] : 0.0f;
+    val1 = warp_reduce_sum(val1);
+    if (lane_id == 0) atomicAdd(Out, val1);
   }
 }
 
@@ -260,16 +266,17 @@ void reduce_cu(tvm::ffi::TensorView A, tvm::ffi::TensorView Out) {
   //     static_cast<float*>(Out.data_ptr()),
   //     static_cast<int>(n));
 
-  int n_vec = static_cast<int>(n) / 4;
-  grid = (n_vec + BLOCK_SIZE * UNROLL - 1) / (BLOCK_SIZE * UNROLL);
-  if (grid < 1) grid = 1;  // tail-only launches still need one block
-  reduce_kernel_v5<<<grid, BLOCK_SIZE, 0, stream>>>(
-      static_cast<const float*>(A.data_ptr()),
-      static_cast<float*>(Out.data_ptr()),
-      static_cast<int>(n));
-
-  // reduce_kernel_v6<<<grid, BLOCK_SIZE, 0, stream>>>(
+  // int n_vec = static_cast<int>(n) / 4;
+  // grid = (n_vec + BLOCK_SIZE * UNROLL - 1) / (BLOCK_SIZE * UNROLL);
+  // if (grid < 1) grid = 1;  // tail-only launches still need one block
+  // reduce_kernel_v5<<<grid, BLOCK_SIZE, 0, stream>>>(
   //     static_cast<const float*>(A.data_ptr()),
   //     static_cast<float*>(Out.data_ptr()),
   //     static_cast<int>(n));
+
+  grid = (n + BLOCK_SIZE * 2 - 1) / (BLOCK_SIZE * 2);
+  reduce_kernel_v6<<<grid, BLOCK_SIZE, 0, stream>>>(
+      static_cast<const float*>(A.data_ptr()),
+      static_cast<float*>(Out.data_ptr()),
+      static_cast<int>(n));
 }
