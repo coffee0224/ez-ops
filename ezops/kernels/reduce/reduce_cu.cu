@@ -150,6 +150,51 @@ __global__ void reduce_kernel_v4(const float* __restrict__ A, float* __restrict_
 
 
 
+// Vectorized loads (float4) + per-thread register accumulation: each thread
+// sums UNROLL*4 elements in registers before writing shared memory once.
+constexpr int UNROLL = 4;
+
+__global__ void reduce_kernel_v5(const float* __restrict__ A, float* __restrict__ Out, int n) {
+  __shared__ float sdata[BLOCK_SIZE];
+
+  int tid = threadIdx.x;
+  int n_vec = n / 4;  // number of full float4's, tail handled scalar below
+  const float4* A4 = reinterpret_cast<const float4*>(A);
+
+  int vidx = blockIdx.x * (BLOCK_SIZE * UNROLL) + tid;
+  float val = 0.0f;
+  #pragma unroll
+  for (int j = 0; j < UNROLL; ++j) {
+    int idx = vidx + j * BLOCK_SIZE;
+    if (idx < n_vec) {
+      float4 v = __ldg(A4 + idx);
+      val += (v.x + v.y) + (v.z + v.w);
+    }
+  }
+  // scalar tail (n % 4 elements), covered once by block 0
+  int rem = n - n_vec * 4;
+  if (blockIdx.x == 0 && tid < rem) {
+    val += A[n_vec * 4 + tid];
+  }
+
+  sdata[tid] = val;
+  __syncthreads();
+
+  for (int s = BLOCK_SIZE / 2; s > 32; s >>= 1) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+  }
+
+  if (tid < 32) {
+    warpReduce(sdata, tid);
+  }
+  if (tid == 0) {
+    atomicAdd(Out, sdata[0]);
+  }
+}
+
 __device__ __forceinline__ float warp_reduce_sum(float val) {
   #pragma unroll
   for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
@@ -159,7 +204,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 }
 // Sum reduction: Out[0] = sum(A). Each block reduces its chunk via warp
 // shuffles and accumulates into Out with a single atomicAdd per block.
-__global__ void reduce_kernel(const float* __restrict__ A, float* __restrict__ Out, int n) {
+__global__ void reduce_kernel_v6(const float* __restrict__ A, float* __restrict__ Out, int n) {
   int tid = threadIdx.x;
   int idx = blockIdx.x * BLOCK_SIZE + tid;
   float val = (idx < n) ? __ldg(A + idx) : 0.0f;
@@ -209,13 +254,21 @@ void reduce_cu(tvm::ffi::TensorView A, tvm::ffi::TensorView Out) {
   //     static_cast<float*>(Out.data_ptr()),
   //     static_cast<int>(n));
 
-  grid = (n + BLOCK_SIZE * 2 - 1) / (BLOCK_SIZE * 2);
-  reduce_kernel_v4<<<grid, BLOCK_SIZE, 0, stream>>>(
+  // grid = (n + BLOCK_SIZE * 2 - 1) / (BLOCK_SIZE * 2);
+  // reduce_kernel_v4<<<grid, BLOCK_SIZE, 0, stream>>>(
+  //     static_cast<const float*>(A.data_ptr()),
+  //     static_cast<float*>(Out.data_ptr()),
+  //     static_cast<int>(n));
+
+  int n_vec = static_cast<int>(n) / 4;
+  grid = (n_vec + BLOCK_SIZE * UNROLL - 1) / (BLOCK_SIZE * UNROLL);
+  if (grid < 1) grid = 1;  // tail-only launches still need one block
+  reduce_kernel_v5<<<grid, BLOCK_SIZE, 0, stream>>>(
       static_cast<const float*>(A.data_ptr()),
       static_cast<float*>(Out.data_ptr()),
       static_cast<int>(n));
 
-  // reduce_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
+  // reduce_kernel_v6<<<grid, BLOCK_SIZE, 0, stream>>>(
   //     static_cast<const float*>(A.data_ptr()),
   //     static_cast<float*>(Out.data_ptr()),
   //     static_cast<int>(n));
