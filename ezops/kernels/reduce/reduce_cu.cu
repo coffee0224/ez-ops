@@ -110,6 +110,46 @@ __global__ void reduce_kernel_v3(const float* __restrict__ A, float* __restrict_
 }
 
 
+
+__device__ void warpReduce(volatile float* cache,int tid){
+    cache[tid]+=cache[tid+32];
+    cache[tid]+=cache[tid+16];
+    cache[tid]+=cache[tid+8];
+    cache[tid]+=cache[tid+4];
+    cache[tid]+=cache[tid+2];
+    cache[tid]+=cache[tid+1];
+}
+
+__global__ void reduce_kernel_v4(const float* __restrict__ A, float* __restrict__ Out, int n) {
+  __shared__ float sdata[BLOCK_SIZE];
+
+  int tid = threadIdx.x;
+  int i = blockIdx.x * blockDim.x * 2 + tid;
+
+  if (i < n) {
+    sdata[tid] = A[i] + A[i + BLOCK_SIZE];
+  } else {
+    sdata[tid] = 0;
+  }
+  __syncthreads();
+  
+  for(int s = BLOCK_SIZE / 2; s > 32; s >>= 1) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid+s];
+    }
+    __syncthreads();
+  }
+
+  if(tid < 32) {
+    warpReduce(sdata,tid);
+  }
+  if (tid == 0) {
+    atomicAdd(Out, sdata[0]);
+  }
+}
+
+
+
 __device__ __forceinline__ float warp_reduce_sum(float val) {
   #pragma unroll
   for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
@@ -163,8 +203,14 @@ void reduce_cu(tvm::ffi::TensorView A, tvm::ffi::TensorView Out) {
   //     static_cast<float*>(Out.data_ptr()),
   //     static_cast<int>(n));
 
+  // grid = (n + BLOCK_SIZE * 2 - 1) / (BLOCK_SIZE * 2);
+  // reduce_kernel_v3<<<grid, BLOCK_SIZE, 0, stream>>>(
+  //     static_cast<const float*>(A.data_ptr()),
+  //     static_cast<float*>(Out.data_ptr()),
+  //     static_cast<int>(n));
+
   grid = (n + BLOCK_SIZE * 2 - 1) / (BLOCK_SIZE * 2);
-  reduce_kernel_v3<<<grid, BLOCK_SIZE, 0, stream>>>(
+  reduce_kernel_v4<<<grid, BLOCK_SIZE, 0, stream>>>(
       static_cast<const float*>(A.data_ptr()),
       static_cast<float*>(Out.data_ptr()),
       static_cast<int>(n));
