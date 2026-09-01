@@ -26,10 +26,11 @@ N_TRIALS = 3
 
 WORKLOADS = [
     # (N, K, label)
-    (4096, 1024, "qwen3-0.6B-qkv-proj"),
+    # (4096, 1024, "qwen3-0.6B-qkv-proj"),
     # (1024, 2048, "qwen3-0.6B-o-proj"),
     # (3072, 1024, "qwen3-0.6B-up-proj"),
     # (1024, 3072, "qwen3-0.6B-down-proj"),
+    (4096, 2048, "qwen3-vl-2B-qkv-proj"),
 ]
 
 

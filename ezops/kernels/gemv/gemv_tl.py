@@ -38,7 +38,7 @@ class NaiveGemvTileLangKernel(BaseKernel):
                 B: T.Buffer((N, K), dtype),
                 C: T.Buffer((N,), dtype),
             ):
-                with T.Kernel(T.ceildiv(N, BLOCK_N)) as bn:
+                with T.Kernel(T.ceildiv(N, BLOCK_N), threads=BLOCK_N) as bn:
                     tn = T.get_thread_binding(0)  # tn = threadIdx.x
                     A_shared = T.alloc_shared((BLOCK_K,), dtype)
                     B_shared = T.alloc_shared((BLOCK_N, BLOCK_K), dtype)
