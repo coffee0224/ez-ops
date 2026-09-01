@@ -374,28 +374,7 @@ class PersistantGemvTilelangKernel(BaseKernel):
         num_sms = self.num_sms
 
         def get_configs():
-            return [
-                {
-                    "BLOCK_N": 8,
-                    "BLOCK_K": 256,
-                    "reduce_threads": 32,
-                },
-                {
-                    "BLOCK_N": 16,
-                    "BLOCK_K": 256,
-                    "reduce_threads": 32,
-                },
-                {
-                    "BLOCK_N": 16,
-                    "BLOCK_K": 128,
-                    "reduce_threads": 32,
-                },
-                {
-                    "BLOCK_N": 8,
-                    "BLOCK_K": 128,
-                    "reduce_threads": 32,
-                },
-            ]
+            return [{"BLOCK_N": 8, "BLOCK_K": 256, "reduce_threads": 32}]
 
         @autotune(
             configs=get_configs(),
@@ -438,7 +417,6 @@ class PersistantGemvTilelangKernel(BaseKernel):
 
                     B_local = T.alloc_local((TILE_K,), dtype)
                     C_accum = T.alloc_local((1,), accum_dtype)
-                    C_reduced = T.alloc_local((1,), accum_dtype)
 
                     for it in T.serial(num_iters):
                         rg = it * num_sms + block_id
@@ -454,26 +432,8 @@ class PersistantGemvTilelangKernel(BaseKernel):
                                         accum_dtype
                                     ) * B_local[k].astype(accum_dtype)
 
-                            with T.attr(
-                                T.comm_reducer(
-                                    lambda x, y: x + y,
-                                    [T.cast(0, accum_dtype)],
-                                ),
-                                "reduce_scope",
-                                T.reinterpret(T.uint64(0), dtype="handle"),
-                            ):
-                                T.evaluate(
-                                    T.tvm_thread_allreduce(
-                                        T.uint32(1),
-                                        C_accum[0],
-                                        True,
-                                        C_reduced[0],
-                                        lane_id,
-                                        dtype="handle",
-                                    )
-                                )
-                            if lane_id == 0 and my_row < N:
-                                C[my_row] = C_reduced[0]
+                            if my_row < N:
+                                C[my_row] = T.warp_reduce_sum(C_accum[0])
 
             return main
 
