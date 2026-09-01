@@ -219,7 +219,7 @@ class SplitkGemvVectorizedTileLangKernel(BaseKernel):
         self._kernel(N=self.N, K=self.K, reduce_threads=32, BLOCK_N=2)(A, B, C)
 
 
-@register_kernel("gemv", "splitk_gemv_vectorized_tvm_tilelang")
+@register_kernel("gemv", "splitk_gemv_vectorized_warp_reduce_tilelang")
 class SplitkGemvVectorizedTvmTileLangKernel(BaseKernel):
     def __init__(self, N: int, K: int):
         self.N = N
@@ -246,9 +246,9 @@ class SplitkGemvVectorizedTvmTileLangKernel(BaseKernel):
                 B: T.Buffer((N, K), dtype),
                 C: T.Buffer((N,), dtype),
             ):
-                with T.Kernel(T.ceildiv(N, BLOCK_N), threads=(BLOCK_N, reduce_threads)) as bn:
-                    tn = T.get_thread_binding(0)
-                    tk = T.get_thread_binding(1)
+                with T.Kernel(T.ceildiv(N, BLOCK_N), threads=(reduce_threads, BLOCK_N)) as bn:
+                    tk = T.get_thread_binding(0)
+                    tn = T.get_thread_binding(1)
                     A_local = T.alloc_local((TILE_K,), dtype)
                     B_local = T.alloc_local((TILE_K,), dtype)
                     C_accum = T.alloc_local((1,), accum_dtype)
@@ -260,24 +260,8 @@ class SplitkGemvVectorizedTvmTileLangKernel(BaseKernel):
                             B_local[k] = B[bn * BLOCK_N + tn, bk * BLOCK_K + tk * TILE_K + k]
                         for k in T.serial(TILE_K):
                             C_accum[0] += A_local[k].astype(accum_dtype) * B_local[k].astype(accum_dtype)
-                    C_reduced = T.alloc_local((1,), accum_dtype)
-                    with T.attr(
-                        T.comm_reducer(lambda x, y: x + y, [T.cast(0, accum_dtype)]),
-                        "reduce_scope",
-                        T.reinterpret(T.uint64(0), dtype="handle"),
-                    ):
-                        T.evaluate(
-                            T.tvm_thread_allreduce(
-                                T.uint32(1),
-                                C_accum[0],
-                                True,
-                                C_reduced[0],
-                                tk,
-                                dtype="handle",
-                            )
-                        )
 
-                    C[bn * BLOCK_N + tn] = C_reduced[0]
+                    C[bn * BLOCK_N + tn] = T.warp_reduce_sum(C_accum[0])
 
             return main
 
