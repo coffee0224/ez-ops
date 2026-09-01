@@ -1,4 +1,10 @@
-"""TileLang backend for the fused_o_proj_ffn op.
+"""Stage-split TileLang backend for the fused_o_proj_ffn op (comparison variant).
+
+The primary ``tilelang`` backend fuses everything into one launch with software
+grid barriers; this variant keeps the four phases as separate kernel launches
+(kept for A/B comparison). Under NCU per-kernel time sums the stage split is
+~3% faster (no barrier/memset cost), but on the eager launch path the single
+launch wins clearly.
 
 Port of mega-qwen's ``ldg_o_proj_postnorm_mlp`` decode phase as persistent
 kernels: every stage launches exactly num_sms CTAs that pull row-tile work
@@ -40,7 +46,7 @@ from ...registry import register_kernel
 RMS_EPS = 1e-6
 
 
-@register_kernel("fused_o_proj_ffn", "tilelang")
+@register_kernel("fused_o_proj_ffn", "tilelang_multilaunch")
 class FusedOProjFfnTileLangKernel(BaseKernel):
     _block_n = 64  # output rows per work unit
     _block_k = 128  # K-tile of every GEMV pipeline
