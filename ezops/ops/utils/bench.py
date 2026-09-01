@@ -107,8 +107,13 @@ def bench_kernel(
                 fn()
         torch.cuda.synchronize()
         graph = g
-    except Exception:
+    except Exception as e:
         graph = None
+        print(
+            f"Warning: CUDA Graph capture failed for {getattr(fn, '__name__', fn)!r} "
+            f"({type(e).__name__}: {e}); falling back to eager execution — "
+            "measured latency may include host dispatch overhead."
+        )
 
     # Warmup graph replay separately — eager warmup above does not
     # exercise the graph launch path, and the first few replays can be
