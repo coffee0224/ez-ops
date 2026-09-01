@@ -1,6 +1,5 @@
 from .attn_decode_triton import AttnDecodeTritonKernel  # noqa: F401
 from .attn_decode_tl import (  # noqa: F401
-    FlashDecodeAttnTileLangKernel,
     GqaFlashDecodeSplitTileLangKernel,
     GqaFlashDecodeTileLangKernel,
 )
