@@ -818,8 +818,15 @@ def _make_gqa_flash_decode_kernel(batch, heads, kv_heads, seq_len, dim, num_spli
     - Tensor layout: ezops passes K/V as [batch, kv_heads, seq_len, dim];
       the example used [batch, seq_len, groups, dim]. Indexing is adapted,
       the algorithm is unchanged.
-    - No mask argument (the ezops op has none); the split kernel keeps the
-      example's per-position bound check against the split's kv range.
+    - No mask argument (the ezops op has none).
+    - Arbitrary seq_len (odd included): the example required
+      seq_len % num_split == 0 and dropped any remainder. Here every
+      split's pipelined phase covers an exactly block_N-aligned chunk
+      (base = floor(seq_len / num_split / block_N) * block_N, same recipe
+      as the TMA backend), and the trailing seq_len - num_split * base
+      positions are handled by the last split in a short tail phase with
+      clamped/zero-filled loads. Aligned shapes take the identical code
+      path (the tail is elided at trace time when the remainder is 0).
     - The example over-read Q (a block_H=64 tile per valid_block_H rows,
       running past the end of Q on the last block). Here the Q tile is
       loaded with a clamped row index and zero-padded, so invalid rows
@@ -858,11 +865,10 @@ def _make_gqa_flash_decode_kernel(batch, heads, kv_heads, seq_len, dim, num_spli
     def get_configs():
         configs = []
         for num_split in num_split_choices:
-            if seq_len % num_split != 0:
-                continue
-            chunk = seq_len // num_split
             for block_n in (128, 64, 32):
-                if chunk % block_n != 0:
+                # Each split's pipelined phase must cover at least one
+                # full tile; the remainder goes to the last split's tail.
+                if seq_len // num_split < block_n:
                     continue
                 for num_stages in (3, 2, 1):
                     smem = (
@@ -882,7 +888,7 @@ def _make_gqa_flash_decode_kernel(batch, heads, kv_heads, seq_len, dim, num_spli
         if not configs:
             raise ValueError(
                 f"No valid config for seq_len={seq_len}, num_split in {num_split_choices}, "
-                f"smem budget {smem_budget} B"
+                f"smem budget {smem_budget} B (need seq_len // num_split >= 32)"
             )
         return configs
 
@@ -904,6 +910,18 @@ def _make_gqa_flash_decode_kernel(batch, heads, kv_heads, seq_len, dim, num_spli
             block_N = 64
         if num_stages is None:
             num_stages = 2
+
+        # KV chunking (recipe from the TMA backend, plus a tail phase):
+        # splits 0..num_split-1 each run `nb` pipelined block_N tiles over
+        # [sid*base, (sid+1)*base) — base is block_N-aligned so no tile
+        # crosses a chunk boundary and no load ever leaves [0, seq_len).
+        # The trailing `rem` positions are handled by the LAST split only,
+        # in a non-pipelined tail with clamped/zero-filled loads. rem == 0
+        # (aligned seq_len) elides the tail at trace time.
+        base = (seq_len // num_split // block_N) * block_N
+        nb = base // block_N
+        rem = seq_len - num_split * base
+        tail_blocks = (rem + block_N - 1) // block_N
 
         if num_split > 1:
 
@@ -953,23 +971,12 @@ def _make_gqa_flash_decode_kernel(batch, heads, kv_heads, seq_len, dim, num_spli
                     T.fill(logsum, 0)
                     T.fill(scores_max, -T.infinity(accum_dtype))
 
-                    kv_chunk = seq_len // num_split
-                    loop_range = T.ceildiv(kv_chunk, block_N)
-                    for k in T.Pipelined(loop_range, num_stages=num_stages):
-                        kv_start = sid * kv_chunk + k * block_N
+                    for k in T.Pipelined(nb, num_stages=num_stages):
+                        kv_start = sid * base + k * block_N
                         T.copy(K[bid, cur_kv_head, kv_start : kv_start + block_N, :], K_shared)
                         T.copy(V[bid, cur_kv_head, kv_start : kv_start + block_N, :], V_shared)
                         T.clear(acc_s)
                         T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                        # Tail of a partial block stays inside the K/V buffer
-                        # (configs keep chunk % block_N == 0) but belongs to
-                        # the next split; mask it out as in the example.
-                        for i, j in T.Parallel(block_h, block_N):
-                            acc_s[i, j] = T.if_then_else(
-                                kv_start + j < (sid + 1) * kv_chunk,
-                                acc_s[i, j],
-                                -T.infinity(accum_dtype),
-                            )
                         T.copy(scores_max, scores_max_prev)
                         T.fill(scores_max, -T.infinity(accum_dtype))
                         T.reduce_max(acc_s, scores_max, dim=1, clear=False)
@@ -986,6 +993,53 @@ def _make_gqa_flash_decode_kernel(batch, heads, kv_heads, seq_len, dim, num_spli
                         for i, j in T.Parallel(block_h, dim):
                             acc_o[i, j] *= scores_scale[i]
                         T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+                    # Remainder tail (odd seq_len etc.): the last split picks
+                    # up the positions the aligned chunks could not cover.
+                    # Non-pipelined loads with clamped index + zero fill keep
+                    # every read inside [0, seq_len); masked scores get -inf.
+                    if sid == num_split - 1:
+                        for tb in T.serial(tail_blocks):
+                            t0 = num_split * base + tb * block_N
+                            for i, j in T.Parallel(block_N, dim):
+                                pos = t0 + i
+                                K_shared[i, j] = T.if_then_else(
+                                    pos < seq_len,
+                                    K[bid, cur_kv_head, T.min(pos, seq_len - 1), j],
+                                    T.cast(0, dtype),
+                                )
+                            for i, j in T.Parallel(block_N, dim):
+                                pos = t0 + i
+                                V_shared[i, j] = T.if_then_else(
+                                    pos < seq_len,
+                                    V[bid, cur_kv_head, T.min(pos, seq_len - 1), j],
+                                    T.cast(0, dtype),
+                                )
+                            T.clear(acc_s)
+                            T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                            for i, j in T.Parallel(block_h, block_N):
+                                acc_s[i, j] = T.if_then_else(
+                                    t0 + j < seq_len,
+                                    acc_s[i, j],
+                                    -T.infinity(accum_dtype),
+                                )
+                            T.copy(scores_max, scores_max_prev)
+                            T.fill(scores_max, -T.infinity(accum_dtype))
+                            T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                            for i in T.Parallel(block_h):
+                                scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                            for i in T.Parallel(block_h):
+                                scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                            for i, j in T.Parallel(block_h, block_N):
+                                acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                            T.reduce_sum(acc_s, scores_sum, dim=1)
+                            for i in T.Parallel(block_h):
+                                logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+                            T.copy(acc_s, acc_s_cast)
+                            for i, j in T.Parallel(block_h, dim):
+                                acc_o[i, j] *= scores_scale[i]
+                            T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
                     for i, j in T.Parallel(block_h, dim):
                         acc_o[i, j] /= logsum[i]
                     for i in T.Parallel(block_h):
@@ -1063,19 +1117,12 @@ def _make_gqa_flash_decode_kernel(batch, heads, kv_heads, seq_len, dim, num_spli
                 T.fill(logsum, 0)
                 T.fill(scores_max, -T.infinity(accum_dtype))
 
-                loop_range = T.ceildiv(seq_len, block_N)
-                for k in T.Pipelined(loop_range, num_stages=num_stages):
+                for k in T.Pipelined(nb, num_stages=num_stages):
                     kv_start = k * block_N
                     T.copy(K[bid, cur_kv_head, kv_start : kv_start + block_N, :], K_shared)
                     T.copy(V[bid, cur_kv_head, kv_start : kv_start + block_N, :], V_shared)
                     T.clear(acc_s)
                     T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-                    for i, j in T.Parallel(block_h, block_N):
-                        acc_s[i, j] = T.if_then_else(
-                            kv_start + j < seq_len,
-                            acc_s[i, j],
-                            -T.infinity(accum_dtype),
-                        )
                     T.copy(scores_max, scores_max_prev)
                     T.fill(scores_max, -T.infinity(accum_dtype))
                     T.reduce_max(acc_s, scores_max, dim=1, clear=False)
@@ -1092,6 +1139,51 @@ def _make_gqa_flash_decode_kernel(batch, heads, kv_heads, seq_len, dim, num_spli
                     for i, j in T.Parallel(block_h, dim):
                         acc_o[i, j] *= scores_scale[i]
                     T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+                # Remainder tail (odd seq_len etc.), same guarded scheme as
+                # the split kernel's tail; traced only when rem > 0.
+                if tail_blocks > 0:
+                    for tb in T.serial(tail_blocks):
+                        t0 = base + tb * block_N
+                        for i, j in T.Parallel(block_N, dim):
+                            pos = t0 + i
+                            K_shared[i, j] = T.if_then_else(
+                                pos < seq_len,
+                                K[bid, cur_kv_head, T.min(pos, seq_len - 1), j],
+                                T.cast(0, dtype),
+                            )
+                        for i, j in T.Parallel(block_N, dim):
+                            pos = t0 + i
+                            V_shared[i, j] = T.if_then_else(
+                                pos < seq_len,
+                                V[bid, cur_kv_head, T.min(pos, seq_len - 1), j],
+                                T.cast(0, dtype),
+                            )
+                        T.clear(acc_s)
+                        T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                        for i, j in T.Parallel(block_h, block_N):
+                            acc_s[i, j] = T.if_then_else(
+                                t0 + j < seq_len,
+                                acc_s[i, j],
+                                -T.infinity(accum_dtype),
+                            )
+                        T.copy(scores_max, scores_max_prev)
+                        T.fill(scores_max, -T.infinity(accum_dtype))
+                        T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                        for i in T.Parallel(block_h):
+                            scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                        for i in T.Parallel(block_h):
+                            scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                        for i, j in T.Parallel(block_h, block_N):
+                            acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                        T.reduce_sum(acc_s, scores_sum, dim=1)
+                        for i in T.Parallel(block_h):
+                            logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+                        T.copy(acc_s, acc_s_cast)
+                        for i, j in T.Parallel(block_h, dim):
+                            acc_o[i, j] *= scores_scale[i]
+                        T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
                 for i, j in T.Parallel(block_h, dim):
                     acc_o[i, j] /= logsum[i]
                 T.copy(acc_o[:valid_block_h, :], O_shared)
