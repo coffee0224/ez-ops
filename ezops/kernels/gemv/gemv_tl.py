@@ -272,8 +272,19 @@ class SplitkGemvVectorizedTvmTileLangKernel(BaseKernel):
         self._kernel(N=self.N, K=self.K, reduce_threads=32, BLOCK_N=2)(A, B, C)
 
 
-@register_kernel("gemv", "autotune_tilelang")
-class AutotuneGemvTileLangKernel(BaseKernel):
+@register_kernel("gemv", "splitk_gemv_vectorized_warp_reduce_autotune_tilelang")
+class SplitkGemvVectorizedWarpReduceAutotuneTileLangKernel(BaseKernel):
+    """Autotuned warp-reduce gemv.
+
+    reduce_threads is pinned to 32: tl::warp_reduce_sum is an unmasked
+    full-warp butterfly reduce, and the reduce dim is threadIdx.x, so any
+    value < 32 mixes adjacent rows' partial sums (BN >= 2) or relies on
+    inactive lanes reading 0 (BN = 1, UB), and any value > 32 sums only
+    part of the row. BLOCK_N is the only real tuning knob: it must keep
+    grid = N / BLOCK_N large enough to fill all SMs (see
+    scripts/sweep_gemv_warp_reduce.py).
+    """
+
     def __init__(self, N: int, K: int):
         self.N = N
         self.K = K
@@ -285,22 +296,10 @@ class AutotuneGemvTileLangKernel(BaseKernel):
         K = self.K
 
         def get_configs():
-            BLOCK_N = [2, 4, 8, 32, 64, 128]
-            reduce_threads = [4, 8, 32]
-            _configs = list(
-                itertools.product(
-                    BLOCK_N,
-                    reduce_threads,
-                )
-            )
-            configs = [
-                {
-                    "BLOCK_N": c[0],
-                    "reduce_threads": c[1],
-                }
-                for c in _configs
-            ]
-            return configs
+            # BLOCK_N >= 32 (1024 threads/block) never wins and underfills
+            # small grids; BLOCK_N must divide N (kernel has no bounds check).
+            block_ns = [bn for bn in [1, 2, 4, 8, 16] if N % bn == 0]
+            return [{"BLOCK_N": bn, "reduce_threads": 32} for bn in block_ns]
 
         @autotune(
             configs=get_configs(),
@@ -312,14 +311,14 @@ class AutotuneGemvTileLangKernel(BaseKernel):
             target="auto",
         )
         def kernel(
-            BLOCK_N=None,
-            reduce_threads=None,
+            BLOCK_N: int = None,
+            reduce_threads: int = None,
         ):
             dtype = "bfloat16"
             accum_dtype = "float"
             if BLOCK_N is None or reduce_threads is None:
                 BLOCK_N = 1
-                reduce_threads = 1
+                reduce_threads = 32
             MAX_TRANSACTION_SIZE_IN_BITS = 128
             TILE_K = MAX_TRANSACTION_SIZE_IN_BITS // DataType(dtype).bits
             BLOCK_K = reduce_threads * TILE_K
@@ -330,9 +329,9 @@ class AutotuneGemvTileLangKernel(BaseKernel):
                 B: T.Buffer((N, K), dtype),
                 C: T.Buffer((N,), dtype),
             ):
-                with T.Kernel(T.ceildiv(N, BLOCK_N), threads=(BLOCK_N, reduce_threads)) as bn:
-                    tn = T.get_thread_binding(0)
-                    tk = T.get_thread_binding(1)
+                with T.Kernel(T.ceildiv(N, BLOCK_N), threads=(reduce_threads, BLOCK_N)) as bn:
+                    tk = T.get_thread_binding(0)
+                    tn = T.get_thread_binding(1)
                     A_local = T.alloc_local((TILE_K,), dtype)
                     B_local = T.alloc_local((TILE_K,), dtype)
                     C_accum = T.alloc_local((1,), accum_dtype)
@@ -344,24 +343,8 @@ class AutotuneGemvTileLangKernel(BaseKernel):
                             B_local[k] = B[bn * BLOCK_N + tn, bk * BLOCK_K + tk * TILE_K + k]
                         for k in T.serial(TILE_K):
                             C_accum[0] += A_local[k].astype(accum_dtype) * B_local[k].astype(accum_dtype)
-                    C_reduced = T.alloc_local((1,), accum_dtype)
-                    with T.attr(
-                        T.comm_reducer(lambda x, y: x + y, [T.cast(0, accum_dtype)]),
-                        "reduce_scope",
-                        T.reinterpret(T.uint64(0), dtype="handle"),
-                    ):
-                        T.evaluate(
-                            T.tvm_thread_allreduce(
-                                T.uint32(1),
-                                C_accum[0],
-                                True,
-                                C_reduced[0],
-                                tk,
-                                dtype="handle",
-                            )
-                        )
 
-                    C[bn * BLOCK_N + tn] = C_reduced[0]
+                    C[bn * BLOCK_N + tn] = T.warp_reduce_sum(C_accum[0])
 
             return main
 
@@ -371,85 +354,6 @@ class AutotuneGemvTileLangKernel(BaseKernel):
         assert A.is_cuda and B.is_cuda and C.is_cuda
         if self._best_kernel is None:
             self._best_kernel = self._kernel()
-        self._best_kernel(A, B, C)
-
-
-@register_kernel("gemv", "alloc_reducer_gemv_tilelang")
-class AllocReducerGemvTileLangKernel(BaseKernel):
-    def __init__(self, N: int, K: int):
-        self.N = N
-        self.K = K
-        self._kernel = self._make_kernel()
-        self._best_kernel = None
-
-    def _make_kernel(self):
-        N = self.N
-        K = self.K
-
-        def get_configs():
-            block_M = [32, 64, 128]
-            block_N = [32, 64, 128]
-            num_stages = [0, 1, 2]
-            threads = [32, 64, 128]
-            _configs = list(itertools.product(block_M, block_N, num_stages, threads))
-            return [
-                {
-                    "block_M": c[0],
-                    "block_N": c[1],
-                    "num_stages": c[2],
-                    "threads": c[3],
-                }
-                for c in _configs
-            ]
-
-        @autotune(
-            configs=get_configs(),
-            warmup=3,
-            rep=20,
-        )
-        @tilelang.jit(
-            out_idx=None,
-            pass_configs={
-                tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-                tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-            },
-        )
-        def kernel(A: T.Tensor, B: T.Tensor, C: T.Tensor, block_M=None, block_N=None, num_stages=None, threads=None):
-            dtype = "bfloat16"
-            accum_dtype = "float"
-            if block_M is None or block_N is None or num_stages is None or threads is None:
-                block_M = 128
-                block_N = 128
-                num_stages = 2
-                threads = 256
-
-            A: T.Tensor((K,), dtype)
-            B: T.Tensor((N, K), dtype)
-            C: T.Tensor((N,), dtype)
-
-            with T.Kernel(T.ceildiv(N, block_M), threads=threads) as i0_m:
-                o_reducer = T.alloc_reducer(block_M, accum_dtype, replication="all")
-                T.clear(o_reducer)
-                for i0_n in T.Pipelined(T.ceildiv(K, block_N), num_stages=num_stages):
-                    a_smem = T.alloc_shared((block_M, block_N), dtype)
-                    T.copy(B[i0_m * block_M, i0_n * block_N], a_smem)
-                    a_frag = T.alloc_fragment((block_M, block_N), dtype)
-                    T.copy(a_smem, a_frag)
-                    x_frag = T.alloc_fragment(block_N, dtype)
-                    T.copy(A[i0_n * block_N], x_frag)
-                    for i1_m, i1_n in T.Parallel(block_M, block_N):
-                        o_reducer[i1_m] += a_frag[i1_m, i1_n].astype(accum_dtype) * x_frag[i1_n].astype(accum_dtype)
-                T.finalize_reducer(o_reducer)
-                T.copy(o_reducer, C[i0_m * block_M])
-
-        return kernel
-
-    def __call__(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor) -> None:
-        assert A.is_cuda and B.is_cuda and C.is_cuda
-        if self._best_kernel is None:
-            # .compile() triggers autotune and returns the compiled JITKernel,
-            # bypassing the autotuner's broken eager-mode execution path.
-            self._best_kernel = self._kernel.compile(A, B, C)
         self._best_kernel(A, B, C)
 
 
