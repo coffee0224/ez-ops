@@ -28,14 +28,12 @@ N_TRIALS = 3
 HEADS = dict(num_heads=16, head_dim=128, num_kv_heads=8)
 
 WORKLOADS = [
-    # (batch, max_seq_len, label)
+    # (batch, max_seq_len, label) — decode-stage op, benchmarked at batch 1
     (1, 128, "qwen3-s128"),
     (1, 1024, "qwen3-s1k"),
     (1, 4096, "qwen3-s4k"),
     (1, 8192, "qwen3-s8k"),
     (1, 32768, "qwen3-s32k"),
-    (2, 8192, "qwen3-b2-s8k"),
-    (4, 8192, "qwen3-b4-s8k"),
 ]
 
 

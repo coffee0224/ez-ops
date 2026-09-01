@@ -32,12 +32,9 @@ SHAPES = {
 }
 
 WORKLOADS = [
-    # (batch, shape key, label)
+    # (batch, shape key, label) — decode-stage op, benchmarked at batch 1
     (1, "qwen3-0.6b", "qwen3-0.6b-b1"),
     (1, "qwen3-vl-2b", "qwen3-vl-2b-b1"),
-    (2, "qwen3-vl-2b", "qwen3-vl-2b-b2"),
-    (4, "qwen3-vl-2b", "qwen3-vl-2b-b4"),
-    (8, "qwen3-vl-2b", "qwen3-vl-2b-b8"),
 ]
 
 
