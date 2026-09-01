@@ -13,6 +13,7 @@ from tabulate import tabulate
 
 from ezops import AttnDecodeOp, list_backends
 from ezops.ops.utils.bench import bench_kernel
+from ezops.registry import get_kernel
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -25,12 +26,15 @@ N_REPEAT = 50
 N_TRIALS = 3
 
 WORKLOADS = [
-    # (batch, num_heads, seq_len, head_dim, label)
-    # (1, 16, 1024, 128, "qwen3-0.6b-s1k"),
-    # (1, 16, 4096, 128, "qwen3-0.6b-s4k"),
-    # (1, 16, 8192, 128, "qwen3-0.6b-s8k"),
-    # (1, 16, 16384, 128, "qwen3-0.6b-s16k"),
-    (1, 16, 32768, 128, "qwen3-0.6b-s16k"),
+    # (batch, num_heads, seq_len, head_dim, num_kv_heads, label)
+    (1, 16, 1024, 128, 16, "qwen3-0.6b-s1k"),
+    (1, 16, 4096, 128, 16, "qwen3-0.6b-s4k"),
+    (1, 16, 8192, 128, 16, "qwen3-0.6b-s8k"),
+    (1, 16, 16384, 128, 16, "qwen3-0.6b-s16k"),
+    (1, 16, 32768, 128, 16, "qwen3-0.6b-s32k"),
+    (1, 16, 32768, 128, 8, "qwen3-0.6b-s32k-kv8"),
+    (1, 16, 32768, 128, 4, "qwen3-0.6b-s32k-kv4"),
+    (1, 16, 32768, 128, 1, "qwen3-0.6b-s32k-kv1"),
 ]
 
 
@@ -86,15 +90,25 @@ def _compute_sol(roofline, profile, input_bytes):
     }
 
 
-def _run_workload(batch, num_heads, seq_len, head_dim, label, profile, backends):
-    """Run all backends for a single workload and print two tables."""
+def _run_workload(batch, num_heads, seq_len, head_dim, num_kv_heads, label, profile, backends):
+    """Run all backends for a single workload and print two tables.
+
+    For GQA workloads (num_kv_heads < num_heads), backends that declare
+    `supports_gqa` get the KV-head-sized K/V directly. Other backends
+    receive K/V pre-expanded to num_heads heads via repeat_interleave —
+    the expansion happens outside the timed region, but the kernel then
+    has to stream the expanded (num_heads/num_kv_heads x larger) K/V.
+    """
     print(f"\n{'=' * 60}")
     print(f"  AttnDecode workload: {label}")
-    print(f"  Q: ({batch}, {num_heads}, 1, {head_dim})  K/V: ({batch}, {num_heads}, {seq_len}, {head_dim})")
+    print(
+        f"  Q: ({batch}, {num_heads}, 1, {head_dim})  "
+        f"K/V: ({batch}, {num_kv_heads}, {seq_len}, {head_dim})"
+    )
     print(f"{'=' * 60}\n")
 
     torch.manual_seed(42)
-    ref_op = AttnDecodeOp(batch, num_heads, seq_len, head_dim, backend="ref")
+    ref_op = AttnDecodeOp(batch, num_heads, seq_len, head_dim, backend="ref", num_kv_heads=num_kv_heads)
     Q, K, V = ref_op.gen_data()
     out_ref = ref_op._ref_forward(Q, K, V)
     roofline = ref_op.get_roofline()
@@ -109,19 +123,36 @@ def _run_workload(batch, num_heads, seq_len, head_dim, label, profile, backends)
 
     sol = _compute_sol(roofline, profile, Q.nbytes + K.nbytes + V.nbytes) if profile else None
 
+    group = num_heads // num_kv_heads
     rows = []
     for backend in backends:
         try:
-            op = AttnDecodeOp(batch, num_heads, seq_len, head_dim, backend=backend)
-            out = op(Q, K, V)
+            supports_gqa = getattr(get_kernel("attn_decode", backend), "supports_gqa", False)
+            row_name = backend
+            if group > 1 and not supports_gqa:
+                # Non-GQA backend: expand K/V to one head per Q head before
+                # the call (outside the timed region).
+                op = AttnDecodeOp(batch, num_heads, seq_len, head_dim, backend=backend)
+                args = (
+                    Q,
+                    K.repeat_interleave(group, dim=1),
+                    V.repeat_interleave(group, dim=1),
+                )
+                row_name = f"{backend} (kv x{group})"
+            else:
+                op = AttnDecodeOp(
+                    batch, num_heads, seq_len, head_dim, backend=backend, num_kv_heads=num_kv_heads
+                )
+                args = (Q, K, V)
+            out = op(*args)
             max_diff = (out - out_ref).abs().max().item()
             passed = op.check(out, out_ref)
-            ms = bench_kernel(op, args=(Q, K, V), n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
+            ms = bench_kernel(op, args=args, n_warmup=WARMUP, n_repeat=N_REPEAT, n_trials=N_TRIALS)
             speedup = ref_ms / ms if ms > 0 else float("inf")
             sol_score = sol["theo_min_s"] / (ms / 1000) if sol else None
             rows.append(
                 [
-                    backend,
+                    row_name,
                     f"{max_diff:.2e}",
                     "PASS" if passed else "FAIL",
                     f"{ms:.4f}",
@@ -200,8 +231,8 @@ def main():
     profile_name = _detect_gpu_profile()
     profile = _load_profile(profile_name) if profile_name else None
 
-    for batch, num_heads, seq_len, head_dim, label in WORKLOADS:
-        _run_workload(batch, num_heads, seq_len, head_dim, label, profile, backends)
+    for batch, num_heads, seq_len, head_dim, num_kv_heads, label in WORKLOADS:
+        _run_workload(batch, num_heads, seq_len, head_dim, num_kv_heads, label, profile, backends)
 
 
 if __name__ == "__main__":
