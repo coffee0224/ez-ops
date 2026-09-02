@@ -36,14 +36,10 @@ QWEN3_VL_2B = dict(
 
 WORKLOADS = [
     # (batch, seq_len, label)
-    (1, 128, "qwen3-vl-2b-s128"),
     (1, 1024, "qwen3-vl-2b-s1k"),
     (1, 4096, "qwen3-vl-2b-s4k"),
     (1, 8192, "qwen3-vl-2b-s8k"),
     (1, 16384, "qwen3-vl-2b-s16k"),
-    (1, 32768, "qwen3-vl-2b-s32k"),
-    (2, 8192, "qwen3-vl-2b-b2-s8k"),
-    (4, 8192, "qwen3-vl-2b-b4-s8k"),
 ]
 
 
