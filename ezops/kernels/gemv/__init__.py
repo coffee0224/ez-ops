@@ -7,5 +7,6 @@ from .gemv_tl import (
     SplitkGemvVectorizedTvmTileLangKernel,
     PersistantGemvTilelangKernel,
 )  # noqa: F401
+from .gemv_ws_tl import WsGemvTileLangKernel  # noqa: F401
 from .gemv_cu import GemvCudaKernel  # noqa: F401
 from .gemv_ws_cu import GemvWsCudaKernel  # noqa: F401
