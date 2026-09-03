@@ -9,6 +9,8 @@ from . import gemv  # noqa: F401
 from . import attn_decode  # noqa: F401
 from . import pdl_gemm  # noqa: F401
 from . import reduce  # noqa: F401
+from . import rmsnorm  # noqa: F401
+from . import softmax  # noqa: F401
 from . import qwen3_dense_decode  # noqa: F401
 from . import fused_qk_norm_rope  # noqa: F401
 from . import fused_o_proj_ffn  # noqa: F401

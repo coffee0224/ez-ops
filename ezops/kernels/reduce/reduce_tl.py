@@ -65,3 +65,56 @@ class ReduceTileLangKernel(BaseKernel):
         assert A.shape == (self.n,) and Out.shape == (1,)
         Out.zero_()
         self._kernel(self.block_size)(A, Out)
+
+
+@register_kernel("reduce", "tilelang_v1")
+class ReduceV1TileLangKernel(BaseKernel):
+    def __init__(self, n: int):
+        self.n = n
+        self.block_size = 256
+        self._kernel = self._make_kernel()
+
+    def _make_kernel(self):
+        N = self.n
+
+        @tilelang.jit(out_idx=None)
+        def kernel(BLOCK: int):
+            NUM_WARP = BLOCK // 32
+
+            @T.prim_func
+            def main(
+                A: T.Buffer((N,), "float32"),
+                Out: T.Buffer((1,), "float32"),
+            ):
+                with T.Kernel(T.ceildiv(N, BLOCK), threads=BLOCK) as bx:
+                    tx = T.get_thread_binding(0)
+                    accm = T.alloc_local((1,), T.float)
+                    T.clear(accm)
+                    s_warp = T.alloc_shared((T.ceildiv(BLOCK, 32),), T.float)
+
+                    idx = bx * BLOCK + tx
+                    warp_id = tx // 32
+                    lane_id = tx % 32
+                    if idx < N:
+                        accm[0] = A[idx]
+                    # syncthread
+                    s_warp[warp_id] = T.warp_reduce_sum(accm[0])
+                    if warp_id == 0:
+                        if lane_id < NUM_WARP:
+                            accm[0] = s_warp[lane_id]
+                        else:
+                            accm[0] = 0
+
+                        accm[0] = T.warp_reduce_sum(accm[0])
+                        if lane_id == 0:
+                            T.atomic_add(Out[0], accm[0])
+
+            return main
+
+        return kernel
+
+    def __call__(self, A: torch.Tensor, Out: torch.Tensor) -> None:
+        assert A.is_cuda and Out.is_cuda
+        assert A.shape == (self.n,) and Out.shape == (1,)
+        Out.zero_()
+        self._kernel(self.block_size)(A, Out)

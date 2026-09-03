@@ -6,6 +6,8 @@ from .gemv import GemvOp
 from .pdl_gemm import PdlGemmOp
 from .qwen3_dense_decode import Qwen3DenseDecodeOp
 from .reduce import ReduceOp
+from .rmsnorm import RmsNormOp
+from .softmax import SoftmaxOp
 from .utils.roofline import RooflineResult
 from .vector_add import VectorAddOp
 
@@ -18,6 +20,8 @@ __all__ = [
     "PdlGemmOp",
     "Qwen3DenseDecodeOp",
     "ReduceOp",
+    "RmsNormOp",
     "RooflineResult",
+    "SoftmaxOp",
     "VectorAddOp",
 ]
