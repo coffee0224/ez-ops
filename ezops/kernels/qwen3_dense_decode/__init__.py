@@ -7,3 +7,6 @@ from .qwen3_dense_decode_multilaunch_tl import (  # noqa: F401
     Qwen3DenseDecodeMultilaunchTileLangKernel,
     Qwen3DenseDecodeMultilaunchPdlTileLangKernel,
 )
+from .qwen3_dense_decode_persistent_ws_tl import (  # noqa: F401
+    Qwen3DenseDecodePersistentWsTileLangKernel,
+)
